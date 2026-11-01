@@ -179,14 +179,7 @@ fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Pla
     if speed.to != src.info().sample_rate {
         src = Box::new(Repitch::new(src, speed.to)?);
     }
-    let channels = src.info().channels;
-    match edits.channels {
-        Channels::Keep => {}
-        Channels::Mono if channels != 1 => src = Box::new(Remix::new(src, 1)),
-        Channels::Stereo { width } if channels == 1 && width > 0.0 => src = Box::new(Widen::new(src, width)),
-        Channels::Stereo { .. } if channels != 2 => src = Box::new(Remix::new(src, 2)),
-        _ => {}
-    }
+    src = with_channels(src, edits);
     let biquads = filters(edits, src.info().sample_rate);
     if !biquads.is_empty() {
         src = Box::new(Filters::new(src, biquads));
@@ -198,6 +191,17 @@ fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Pla
         src = Box::new(Effects::new(src, edits));
     }
     Ok(src)
+}
+
+/// The editor's channel setting as a stage (nothing if it changes nothing).
+pub fn with_channels<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn AudioSource + 'a> {
+    let channels = src.info().channels;
+    match edits.channels {
+        Channels::Mono if channels != 1 => Box::new(Remix::new(src, 1)),
+        Channels::Stereo { width } if channels == 1 && width > 0.0 => Box::new(Widen::new(src, width)),
+        Channels::Stereo { .. } if channels != 2 => Box::new(Remix::new(src, 2)),
+        _ => src,
+    }
 }
 
 /// The volume stage.
@@ -743,12 +747,18 @@ pub fn preview<'a>(
     let plan = Plan::new(edits, info.sample_rate, Some(total));
     let end = plan.end.unwrap_or(total);
     let from = from.clamp(plan.start, end.saturating_sub(1));
+    // Start a little earlier and throw that away, so filters, the limiter and effect tails
+    // are where the full render has them (starting cold, the first moments would differ).
+    let preroll = (preroll_secs(edits, info.sample_rate) * plan.speed * info.sample_rate as f64) as u64;
+    let begin = if plan.reverse { (from + preroll).min(end - 1) } else { from.saturating_sub(preroll).max(plan.start) };
     let src: Box<dyn AudioSource> = if plan.reverse {
-        Box::new(ReversedMemory::new(samples, info, plan.start, from + 1))
+        Box::new(ReversedMemory::new(samples, info, plan.start, begin + 1))
     } else {
-        Box::new(MemorySource::new(samples, info, from, Some(end)))
+        Box::new(MemorySource::new(samples, info, begin, Some(end)))
     };
-    let mut chain = with_volume(after_pick(src, edits, &plan, plan.output_index(from, end))?, edits, info.channels, measured);
+    let offset = plan.output_index(begin, end);
+    let chain = with_volume(after_pick(src, edits, &plan, offset)?, edits, info.channels, measured);
+    let mut chain: Box<dyn AudioSource> = Box::new(Skip::new(chain, plan.output_index(from, end) - offset));
     if channels != chain.info().channels {
         chain = Box::new(Remix::new(chain, channels.clamp(1, 2)));
     }
@@ -756,6 +766,64 @@ pub fn preview<'a>(
         chain = Box::new(Resample::new(chain, rate)?);
     }
     Ok(chain)
+}
+
+/// How much audio (in output seconds) the preview runs before the playhead so that every
+/// stage with a memory has settled: the limiter's release, the stretcher's segments, filter
+/// ringing, and the echo and reverb tails (capped, so a near-endless echo doesn't delay
+/// playback much).
+fn preroll_secs(edits: &AudioEdits, rate: u32) -> f64 {
+    let mut secs = 0.5;
+    if let Some(e) = &edits.echo {
+        secs += EchoFx::new(e, 1, rate).tail() as f64 / rate as f64;
+    }
+    if let Some(r) = &edits.reverb {
+        secs += ReverbFx::new(r, 1, rate).tail() as f64 / rate as f64;
+    }
+    secs.min(10.0)
+}
+
+/// Drops the first `frames` frames.
+struct Skip<'a> {
+    inner: Box<dyn AudioSource + 'a>,
+    frames: u64,
+    buf: Vec<f32>,
+}
+
+impl<'a> Skip<'a> {
+    fn new(inner: Box<dyn AudioSource + 'a>, frames: u64) -> Self {
+        Self { inner, frames, buf: Vec::new() }
+    }
+}
+
+impl AudioSource for Skip<'_> {
+    fn info(&self) -> &StreamInfo {
+        self.inner.info()
+    }
+    fn tags(&self) -> &Tags {
+        self.inner.tags()
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        if self.frames == 0 {
+            return self.inner.next_chunk();
+        }
+        let ch = self.inner.info().channels as usize;
+        loop {
+            let frames = std::mem::take(&mut self.frames);
+            let Some(chunk) = self.inner.next_chunk()? else { return Ok(None) };
+            let n = (chunk.len() / ch) as u64;
+            if frames >= n {
+                self.frames = frames - n;
+                continue;
+            }
+            self.buf.clear();
+            self.buf.extend_from_slice(&chunk[frames as usize * ch..]);
+            return Ok(Some(&self.buf));
+        }
+    }
+    fn end_note(&self) -> Option<String> {
+        self.inner.end_note()
+    }
 }
 
 /// How a speed and pitch change is carried out: time-stretch by `stretch` (output length over
@@ -1663,5 +1731,28 @@ mod tests {
         let out = drain(apply(Box::new(src), &e, None).unwrap());
         assert_eq!(out.len(), 4000, "kept from 1 s to the real end at 5 s");
         assert_eq!(out[out.len() - 1], 4999.0);
+    }
+
+    #[test]
+    fn preview_from_mid_way_matches_the_render_even_with_memory_in_the_chain() {
+        let rate = 16_000;
+        let samples: Arc<[f32]> = sine(330.0, 0.3, rate, 6.0).into();
+        let i = info_at(rate, 1, samples.len());
+        let e = AudioEdits {
+            trim_start: 0.5,
+            low_cut: Some(150.0),
+            channels: Channels::Stereo { width: 0.7 },
+            echo: Some(Echo { delay_ms: 200.0, feedback: 0.3, mix: 0.4 }),
+            reverb: Some(Reverb::ROOM),
+            volume: Volume::Gain(6.0),
+            ..Default::default()
+        };
+        let full = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None).unwrap());
+        // Play from 4 s in: 3.5 s into the result.
+        let part = drain(preview(samples, &i, &e, None, 4 * rate as u64, 2, rate).unwrap());
+        let skip = (3.5 * rate as f64) as usize * 2;
+        assert_eq!(part.len(), full.len() - skip);
+        let worst = part.iter().zip(&full[skip..]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-3, "differs by up to {worst}");
     }
 }

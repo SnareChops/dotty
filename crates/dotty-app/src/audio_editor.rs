@@ -4,7 +4,8 @@
 
 use crate::player::{Player, Request};
 use codecs_audio::StreamInfo;
-use codecs_audio::edit::{CEILING, Measurement, Plan, decode_all, limits, measure_memory, volume_gain};
+use codecs_audio::AudioSource;
+use codecs_audio::edit::{CEILING, Measurement, MemorySource, Plan, decode_all, limits, measure_memory, volume_gain, with_channels};
 use dotty_core::{AudioEdits, Channels, EditOp, Edits, Format, JobId, Reverb, Volume};
 use eframe::egui;
 use std::path::PathBuf;
@@ -142,17 +143,28 @@ impl Peaks {
         Self { small, big }
     }
 
-    /// Min and max over frames `a..b`.
+    /// Min and max over frames `a..b`, scanning `samples` for short spans.
     fn range(&self, samples: &[f32], channels: usize, a: usize, b: usize) -> (f32, f32) {
         let b = b.max(a + 1);
         if b - a <= BLOCK * 2 {
-            let (lo, hi) = (a * channels, (b * channels).min(samples.len()));
-            return if lo < hi { min_max(samples[lo..hi].iter().copied()) } else { (0.0, 0.0) };
+            return scan(samples, channels, a, b);
         }
+        self.blocks(a, b)
+    }
+
+    /// Min and max over frames `a..b` from the blocks alone (may look a block wider).
+    fn blocks(&self, a: usize, b: usize) -> (f32, f32) {
+        let b = b.max(a + 1);
         let (level, size) = if b - a <= BIG_BLOCK * 2 { (&self.small, BLOCK) } else { (&self.big, BIG_BLOCK) };
         let (lo, hi) = (a / size, b.div_ceil(size).min(level.len()));
         if lo < hi { merge(level[lo..hi].iter().copied()) } else { (0.0, 0.0) }
     }
+}
+
+/// Min and max over frames `a..b` of interleaved `samples`.
+fn scan(samples: &[f32], channels: usize, a: usize, b: usize) -> (f32, f32) {
+    let (lo, hi) = (a * channels, (b * channels).min(samples.len()));
+    if lo < hi { min_max(samples[lo..hi].iter().copied()) } else { (0.0, 0.0) }
 }
 
 fn min_max(it: impl Iterator<Item = f32>) -> (f32, f32) {
@@ -206,21 +218,54 @@ struct Session {
     /// The level of the audio reaching the volume stage, for the edits it was measured with
     /// (only the ones before that stage matter).
     measured: Option<(AudioEdits, Measurement)>,
-    measuring: Option<Measuring>,
+    measuring: Option<Background<AudioEdits, Measurement>>,
+    /// Waveform peaks of the whole file after the channel setting (a mono mixdown can
+    /// cancel, widening raises peaks), for the setting they were made with.
+    display: Option<(Channels, Arc<Peaks>)>,
+    display_job: Option<Background<Channels, Peaks>>,
+    /// The visible stretch after the channel setting, for close zoom levels.
+    slice: Option<Slice>,
     /// Height the controls under the waveform took last frame (they wrap on narrow windows).
     controls_height: f32,
     /// See [`AudioEditor::output_channels`].
     output_channels: Option<u16>,
+    /// The mono → stereo width last set, kept while another channel setting is picked.
+    width: f32,
 }
 
 /// A measurement running in the background; dropping it cancels it.
-struct Measuring {
-    key: AudioEdits,
-    rx: mpsc::Receiver<codecs_audio::edit::Measurement>,
+/// Frames `start..end` rendered with channel setting `setting`.
+struct Slice {
+    start: u64,
+    end: u64,
+    setting: Channels,
+    data: Arc<[f32]>,
+    channels: usize,
+}
+
+/// Work running on another thread for the edits in `key`; dropping it cancels it.
+struct Background<K, T> {
+    key: K,
+    rx: mpsc::Receiver<T>,
     cancel: Arc<AtomicBool>,
 }
 
-impl Drop for Measuring {
+impl<K, T: Send + 'static> Background<K, T> {
+    fn spawn(ctx: &egui::Context, key: K, work: impl FnOnce(&AtomicBool) -> Option<T> + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (stop, ctx) = (cancel.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            if let Some(v) = work(&stop) {
+                let _ = tx.send(v);
+                ctx.request_repaint();
+            }
+        });
+        Self { key, rx, cancel }
+    }
+}
+
+impl<K, T> Drop for Background<K, T> {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -252,8 +297,15 @@ impl Session {
             silence_db: -50.0,
             measured: None,
             measuring: None,
+            display: None,
+            display_job: None,
+            slice: None,
             controls_height: 180.0,
             output_channels: None,
+            width: match edits.channels {
+                Channels::Stereo { width } => width,
+                _ => 0.0,
+            },
         };
         s.cursor = s.result_start();
         s
@@ -356,6 +408,54 @@ impl Session {
 
     /// Collect a finished measurement, and start one when the edits it depends on changed
     /// (not mid-drag, so dragging a handle doesn't start dozens).
+    /// The channel setting, if it changes what the waveform looks like.
+    fn channel_view(&self) -> Option<Channels> {
+        let c = self.edits.without_noops(self.info.channels).channels;
+        (c != Channels::Keep).then_some(c)
+    }
+
+    /// Frames `lo..hi` after the channel setting `c`, interleaved, and their channel count.
+    fn render_channels(&self, c: Channels, lo: u64, hi: u64, cancel: &AtomicBool) -> Option<(Vec<f32>, usize)> {
+        render_channels(self.samples.clone(), &self.info, c, lo, hi, cancel)
+    }
+
+    /// Collect finished waveform peaks for the channel setting, and start them when it changes.
+    fn update_display(&mut self, ctx: &egui::Context, pointer_down: bool) {
+        if let Some(job) = &self.display_job
+            && let Ok(peaks) = job.rx.try_recv()
+        {
+            self.display = Some((job.key, Arc::new(peaks)));
+            self.display_job = None;
+        }
+        let Some(key) = self.channel_view() else {
+            self.display_job = None;
+            return;
+        };
+        let ready = self.display.as_ref().is_some_and(|d| d.0 == key);
+        if pointer_down || ready || self.display_job.as_ref().is_some_and(|j| j.key == key) {
+            return;
+        }
+        let (samples, info, total) = (self.samples.clone(), self.info.clone(), self.total);
+        self.display_job = Some(Background::spawn(ctx, key, move |stop| {
+            let (v, ch) = render_channels(samples, &info, key, 0, total, stop)?;
+            Some(Peaks::new(&v, ch))
+        }));
+    }
+
+    /// The visible frames `a..b` after the channel setting, cached until the view or the
+    /// setting changes.
+    fn visible_slice(&mut self, c: Channels, a: u64, b: u64) -> Option<(u64, Arc<[f32]>, usize)> {
+        if let Some(s) = &self.slice
+            && (s.start, s.end, s.setting) == (a, b, c)
+        {
+            return Some((a, s.data.clone(), s.channels));
+        }
+        let (v, channels) = self.render_channels(c, a, b, &AtomicBool::new(false))?;
+        let data: Arc<[f32]> = v.into();
+        self.slice = Some(Slice { start: a, end: b, setting: c, data: data.clone(), channels });
+        Some((a, data, channels))
+    }
+
     fn update_measurement(&mut self, ctx: &egui::Context, pointer_down: bool) {
         if let Some(m) = &self.measuring {
             match m.rx.try_recv() {
@@ -373,17 +473,8 @@ impl Session {
         if pointer_down || self.measurement().is_some() || self.measuring.as_ref().is_some_and(|m| m.key == key) {
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (samples, info, stop, ctx) = (self.samples.clone(), self.info.clone(), cancel.clone(), ctx.clone());
-        let output_channels = self.output_channels;
-        std::thread::spawn(move || {
-            if let Ok(m) = measure_memory(samples, &info, &key, output_channels, &stop) {
-                let _ = tx.send(m);
-                ctx.request_repaint();
-            }
-        });
-        self.measuring = Some(Measuring { key, rx, cancel });
+        let (samples, info, output_channels) = (self.samples.clone(), self.info.clone(), self.output_channels);
+        self.measuring = Some(Background::spawn(ctx, key, move |stop| measure_memory(samples, &info, &key, output_channels, stop).ok()));
     }
 
     fn position(&self) -> u64 {
@@ -427,7 +518,12 @@ impl Session {
         let before = self.edits;
         // Reaching the end leaves the playhead where playback started, like most players.
         self.player.reap();
-        self.update_measurement(ui.ctx(), ui.input(|i| i.pointer.any_down()));
+        if let Some(e) = self.player.take_error() {
+            self.error = Some(e);
+        }
+        let pointer_down = ui.input(|i| i.pointer.any_down());
+        self.update_measurement(ui.ctx(), pointer_down);
+        self.update_display(ui.ctx(), pointer_down);
         if self.player.is_playing() {
             ui.ctx().request_repaint();
         }
@@ -665,13 +761,32 @@ impl Session {
         let dim = visuals.weak_text_color().gamma_multiply(0.6);
         let width = rect.width().max(1.0) as usize;
         let per_px = self.view_len / width as f64;
+        // The samples to draw from: the source, or after the channel setting (a Mono
+        // mixdown can cancel, widening raises peaks). Close up, the visible stretch is
+        // rendered; further out, whole-file peaks made in the background are used.
+        let visible = (self.view_start.floor() as u64, ((self.view_start + self.view_len).ceil() as u64 + 1).min(self.total));
+        let view = self.channel_view();
+        let close = per_px <= (BLOCK * 2) as f64;
+        let slice = view.filter(|_| close).and_then(|c| self.visible_slice(c, visible.0, visible.1));
+        let display = view.and_then(|c| self.display.as_ref().filter(|d| d.0 == c).map(|d| d.1.clone()));
+        let range = |a: u64, b: u64| -> (f32, f32) {
+            match (&slice, &display) {
+                (Some((start, data, sch)), _) => scan(data, *sch, (a - start) as usize, (b.max(a + 1) - start) as usize),
+                (None, Some(p)) => p.blocks(a as usize, b as usize),
+                _ => self.peaks.range(&self.samples, ch, a as usize, b as usize),
+            }
+        };
         if per_px < 1.0 {
             // Closer than one frame per pixel: join the samples instead.
-            let a = self.view_start.floor() as u64;
-            let b = ((self.view_start + self.view_len).ceil() as u64 + 1).min(self.total);
+            let (a, b) = visible;
+            let (data, start, dch): (&[f32], u64, usize) = match &slice {
+                Some((start, data, sch)) => (data, *start, *sch),
+                None => (&self.samples, 0, ch),
+            };
             let points: Vec<egui::Pos2> = (a..b)
                 .map(|f| {
-                    let s = self.samples[f as usize * ch..f as usize * ch + ch].iter().sum::<f32>() / ch as f32;
+                    let i = (f - start) as usize * dch;
+                    let s = data.get(i..i + dch).map_or(0.0, |v| v.iter().sum::<f32>() / dch as f32);
                     egui::pos2(self.frame_to_x(rect, f as f64 + 0.5), mid - level(s, f) * half)
                 })
                 .collect();
@@ -683,7 +798,7 @@ impl Session {
                 if a >= self.total {
                     break;
                 }
-                let (lo, hi) = self.peaks.range(&self.samples, ch, a as usize, b as usize);
+                let (lo, hi) = range(a, b.min(visible.1).max(a + 1));
                 let centre = (a + b) / 2;
                 let inside = (kept_a..kept_b).contains(&centre);
                 let x = rect.left() + px as f32 + 0.5;
@@ -824,18 +939,18 @@ impl Session {
 
     fn channel_controls(&mut self, ui: &mut egui::Ui) {
         let source = self.info.channels;
+        let stereo_name = if source == 1 { "Mono → stereo" } else { "Stereo" };
         ui.horizontal_wrapped(|ui| {
             ui.strong("Channels");
             let e = &mut self.edits;
-            let mut width = match e.channels {
-                Channels::Stereo { width } => width,
-                _ => 0.0,
-            };
-            let label = match (source, e.channels) {
-                (1, Channels::Stereo { .. }) => "Mono → stereo",
-                (_, Channels::Stereo { .. }) => "Stereo",
-                (_, Channels::Mono) => "Mono",
-                (_, Channels::Keep) => "Keep",
+            // Remembered while another setting is picked, so switching back keeps it.
+            if let Channels::Stereo { width } = e.channels {
+                self.width = width;
+            }
+            let label = match e.channels {
+                Channels::Stereo { .. } => stereo_name,
+                Channels::Mono => "Mono",
+                Channels::Keep => "Keep",
             };
             let stereo_help = if source == 1 {
                 "Copy the mono sound to both sides, so echo and reverb can spread out; Width makes it sound wider"
@@ -850,15 +965,15 @@ impl Session {
                     e.channels = Channels::Mono;
                 }
                 let stereo = matches!(e.channels, Channels::Stereo { .. });
-                if ui.selectable_label(stereo, if source == 1 { "Mono → stereo" } else { "Stereo" }).on_hover_text(stereo_help).clicked() && !stereo {
-                    e.channels = Channels::Stereo { width };
+                if ui.selectable_label(stereo, stereo_name).on_hover_text(stereo_help).clicked() && !stereo {
+                    e.channels = Channels::Stereo { width: self.width };
                 }
             });
             if source == 1 && matches!(e.channels, Channels::Stereo { .. }) {
-                ui.add(egui::Slider::new(&mut width, 0.0..=1.0).text("width").fixed_decimals(2)).on_hover_text(
+                ui.add(egui::Slider::new(&mut self.width, 0.0..=1.0).text("width").fixed_decimals(2)).on_hover_text(
                     "0 puts the same sound on both sides. More spreads it out (pseudo-stereo); it still sounds right played back in mono, and the bass stays in the middle.",
                 );
-                e.channels = Channels::Stereo { width };
+                e.channels = Channels::Stereo { width: self.width };
             }
         });
     }
@@ -1080,6 +1195,8 @@ impl Session {
         let mut img = egui::ColorImage::filled(THUMB, egui::Color32::TRANSPARENT);
         let plan = self.plan();
         let (a, b) = self.kept();
+        // After the channel setting, if it changes the picture (done once, on Done).
+        let rendered = self.channel_view().and_then(|c| self.render_channels(c, a, b, &AtomicBool::new(false)));
         let len = plan.output_len(b - a);
         let ch = self.info.channels as usize;
         let color = egui::Color32::from_rgb(WAVE_RGB[0], WAVE_RGB[1], WAVE_RGB[2]);
@@ -1091,7 +1208,10 @@ impl Session {
             let o1 = (len * (x as u64 + 1) / w as u64).max(o0 + 1);
             let (s0, s1) = ((o0 as f64 * plan.speed) as u64, ((o1 as f64 * plan.speed) as u64).min(b - a));
             let (f0, f1) = if plan.reverse { (b - s1.max(s0 + 1), b - s0) } else { (a + s0, a + s1.max(s0 + 1)) };
-            let (lo, hi) = self.peaks.range(&self.samples, ch, f0 as usize, f1 as usize);
+            let (lo, hi) = match &rendered {
+                Some((v, rch)) => scan(v, *rch, (f0 - a) as usize, (f1 - a) as usize),
+                None => self.peaks.range(&self.samples, ch, f0 as usize, f1 as usize),
+            };
             let g = plan.gain((o0 + o1) / 2, len) * vol;
             let scale = |v: f32| if limited { (v * g).clamp(-CEILING, CEILING) } else { (v * g).clamp(-1.0, 1.0) };
             let top = (mid - scale(hi) * mid).floor().max(0.0) as usize;
@@ -1102,6 +1222,25 @@ impl Session {
         }
         img
     }
+}
+
+/// Frames `lo..hi` of `samples` after the channel setting `c`, interleaved, with their
+/// channel count. A little audio before `lo` is run first so the widening's delay and filter
+/// have settled, as they have in the full render.
+fn render_channels(samples: Arc<[f32]>, info: &StreamInfo, c: Channels, lo: u64, hi: u64, cancel: &AtomicBool) -> Option<(Vec<f32>, usize)> {
+    let warm = (info.sample_rate as u64 / 20).min(lo);
+    let edits = AudioEdits { channels: c, ..Default::default() };
+    let mut src = with_channels(Box::new(MemorySource::new(samples, info, lo - warm, Some(hi))), &edits);
+    let ch = src.info().channels as usize;
+    let mut out = Vec::new();
+    while let Ok(Some(chunk)) = src.next_chunk() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        out.extend_from_slice(chunk);
+    }
+    out.drain(..(warm as usize * ch).min(out.len()));
+    Some((out, ch))
 }
 
 /// A time text box: shows `value` until edited; returns a newly typed value on Enter or
@@ -1283,5 +1422,56 @@ mod tests {
         s.edits.channels = Channels::Mono;
         let Outcome::Done { edits: Some(e), .. } = s.done() else { panic!("mono is a change") };
         assert_eq!(e.audio().unwrap().channels, Channels::Mono);
+    }
+
+    /// Rows of the thumbnail with any waveform pixel in them.
+    fn inked_rows(img: &egui::ColorImage) -> usize {
+        let [w, h] = img.size;
+        (0..h).filter(|&y| (0..w).any(|x| img[(x, y)].a() > 0)).count()
+    }
+
+    #[test]
+    fn the_waveform_and_thumbnail_follow_the_channel_setting() {
+        // The loud part is +0.5 left and -0.5 right: mixed to mono it cancels out.
+        let mut s = session(5);
+        s.set_trim(1.0, 3.0);
+        assert!(inked_rows(&s.thumbnail()) > THUMB[1] / 2, "as stereo it's loud");
+        s.edits.channels = Channels::Mono;
+        assert!(inked_rows(&s.thumbnail()) <= 2, "mixed to mono it's silent");
+
+        // Close up, the visible stretch is rendered (and cached).
+        let (start, data, ch) = s.visible_slice(Channels::Mono, 1500, 1600).unwrap();
+        assert_eq!((start, data.len(), ch), (1500, 100, 1));
+        assert!(data.iter().all(|v| v.abs() < 1e-6));
+        let (_, again, _) = s.visible_slice(Channels::Mono, 1500, 1600).unwrap();
+        assert!(Arc::ptr_eq(&data, &again), "same view, same render");
+
+        // Further out, whole-file peaks come from the background.
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !s.display.as_ref().is_some_and(|d| d.0 == Channels::Mono) {
+            s.update_display(&ctx, false);
+            assert!(std::time::Instant::now() < deadline, "peaks never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (lo, hi) = s.display.as_ref().unwrap().1.blocks(1000, 3000);
+        assert!(lo.abs() < 1e-6 && hi.abs() < 1e-6);
+        // Back to stereo (already the source's layout): the source waveform again.
+        s.edits.channels = Channels::Stereo { width: 0.0 };
+        assert_eq!(s.channel_view(), None);
+    }
+
+    #[test]
+    fn widening_a_mono_file_shows_its_raised_peaks() {
+        let rate = 8000u32;
+        let samples: Vec<f32> = (0..rate as usize).map(|i| (i as f32 * 0.9).sin() * 0.5).collect();
+        let info = StreamInfo { sample_rate: rate, channels: 1, source_bits: Some(16), total_frames: Some(rate as u64), source_rate: rate };
+        let peaks = Peaks::new(&samples, 1);
+        let mut s = Session::new(samples.into(), info, peaks, AudioEdits::default());
+        s.edits.channels = Channels::Stereo { width: 1.0 };
+        let (_, data, ch) = s.visible_slice(Channels::Stereo { width: 1.0 }, 2000, 4000).unwrap();
+        assert_eq!(ch, 2);
+        let (_, hi) = scan(&data, 2, 0, 2000);
+        assert!(hi > 0.6, "widening adds to one side: peak {hi}");
     }
 }

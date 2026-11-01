@@ -11,10 +11,14 @@ use dotty_core::AudioEdits;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 /// Seconds of audio buffered ahead of the device.
 const AHEAD: f64 = 0.25;
+/// A device that hasn't asked for audio for this long has gone away (some backends just
+/// stop calling instead of reporting an error).
+const STALL: Duration = Duration::from_secs(2);
 
 /// What one play request needs.
 pub struct Request {
@@ -44,6 +48,28 @@ struct Playing {
     /// Device frames at which each loop pass after the first begins (passes can be longer
     /// than the kept part: echo and reverb tails).
     passes: Arc<Mutex<Vec<u64>>>,
+    /// Set by the stream's error callback when the device fails for good.
+    failure: Arc<Mutex<Option<String>>>,
+    /// Device callbacks so far, and when the count last moved.
+    beats: Arc<AtomicU64>,
+    last_beat: Cell<(u64, Instant)>,
+}
+
+impl Playing {
+    /// Why playback can't go on, if it can't.
+    fn failed(&self) -> Option<String> {
+        if let Some(f) = self.failure.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Some(f);
+        }
+        let beats = self.beats.load(Ordering::Relaxed);
+        let (seen, at) = self.last_beat.get();
+        if beats != seen {
+            self.last_beat.set((beats, Instant::now()));
+            None
+        } else {
+            (at.elapsed() > STALL).then(|| "the audio output stopped responding".to_string())
+        }
+    }
 }
 
 #[derive(Default)]
@@ -60,6 +86,13 @@ impl Drop for Playing {
 impl Player {
     pub fn is_playing(&self) -> bool {
         self.playing.as_ref().is_some_and(|p| !p.finished.load(Ordering::Relaxed))
+    }
+
+    /// If the output device failed or vanished, stop and say why.
+    pub fn take_error(&mut self) -> Option<String> {
+        let err = self.playing.as_ref().and_then(Playing::failed)?;
+        self.playing = None;
+        Some(err)
     }
 
     /// Stop if the end was reached; returns whether it just stopped that way.
@@ -121,13 +154,23 @@ impl Player {
         let finished = Arc::new(AtomicBool::new(false));
         let produced_all = Arc::new(AtomicBool::new(false));
         let passes = Arc::new(Mutex::new(Vec::new()));
+        let failure = Arc::new(Mutex::new(None));
+        let beats = Arc::new(AtomicU64::new(0));
 
         let total = (req.samples.len() / req.info.channels.max(1) as usize) as u64;
         let plan = Plan::new(&req.edits, req.info.sample_rate, Some(total));
         let from = req.from.clamp(plan.start, plan.end.unwrap_or(total).saturating_sub(1));
         let source_rate = req.info.sample_rate;
 
-        let feed = Feed { rx, channels: channels as usize, played: played.clone(), produced_all: produced_all.clone(), finished: finished.clone() };
+        let feed = Feed {
+            rx,
+            channels: channels as usize,
+            played: played.clone(),
+            produced_all: produced_all.clone(),
+            finished: finished.clone(),
+            beats: beats.clone(),
+            failure: failure.clone(),
+        };
         use cpal::SampleFormat as F;
         let stream = match supported.sample_format() {
             F::F32 => build::<f32>(&device, &config, feed, device_channels),
@@ -186,6 +229,9 @@ impl Player {
             plan,
             total,
             passes,
+            failure,
+            beats,
+            last_beat: Cell::new((0, Instant::now())),
         });
         Ok(())
     }
@@ -199,6 +245,14 @@ struct Feed {
     played: Arc<AtomicU64>,
     produced_all: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    beats: Arc<AtomicU64>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+/// Whether a stream error means playback can't go on. Rerouting to another device, a
+/// buffer underrun and not getting realtime priority are reported but harmless.
+fn fatal(kind: cpal::ErrorKind) -> bool {
+    !matches!(kind, cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied)
 }
 
 fn build<T: SizedSample + FromSample<f32>>(
@@ -207,7 +261,14 @@ fn build<T: SizedSample + FromSample<f32>>(
     mut feed: Feed,
     device_channels: usize,
 ) -> Result<cpal::Stream, String> {
+    let failure = feed.failure.clone();
+    let on_error = move |e: cpal::Error| {
+        if fatal(e.kind()) {
+            *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
+        }
+    };
     let callback = move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
+        feed.beats.fetch_add(1, Ordering::Relaxed);
         let mut frames = 0u64;
         for frame in out.chunks_exact_mut(device_channels) {
             if feed.rx.slots() < feed.channels {
@@ -225,7 +286,7 @@ fn build<T: SizedSample + FromSample<f32>>(
         }
     };
     device
-        .build_output_stream(*config, callback, |e| eprintln!("audio output: {e}"), None)
+        .build_output_stream(*config, callback, on_error, None)
         .map_err(|e| e.to_string())
 }
 
