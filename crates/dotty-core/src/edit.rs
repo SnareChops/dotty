@@ -49,6 +49,14 @@ impl Edits {
         })
     }
 
+    /// Which part of a video becomes images, if picked.
+    pub fn frames(&self) -> Option<&FrameSelection> {
+        self.ops.iter().find_map(|op| match op {
+            EditOp::Frames(f) => Some(f),
+            _ => None,
+        })
+    }
+
     /// The audio edits, if any.
     pub fn audio(&self) -> Option<&AudioEdits> {
         self.ops.iter().find_map(|op| match op {
@@ -75,6 +83,25 @@ pub enum EditOp {
     Crop(Region),
     /// Trim, fades and other changes to an audio file.
     Audio(AudioEdits),
+    /// The frame (or range of frames) of a video that becomes an image. Image edits after
+    /// it apply to those frames, in order.
+    Frames(FrameSelection),
+}
+
+/// Which part of a video becomes images. Unset fields take the defaults for the target.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FrameSelection {
+    /// The frame (still images), or where the range starts (animations, frame folders), in
+    /// seconds.
+    pub start: f64,
+    /// Where the range ends; `None` = as far as the size budget allows.
+    pub end: Option<f64>,
+    /// Frames per second of an animation or frame folder.
+    pub fps: Option<f32>,
+    /// Longest side in pixels.
+    pub max_side: Option<u32>,
+    /// Lower the frame rate, then the size, so a longer range fits the budget.
+    pub fit_longer: bool,
 }
 
 /// Changes to an audio file. Unlike image edits these are a fixed set of knobs: the

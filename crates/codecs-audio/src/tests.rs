@@ -965,7 +965,12 @@ fn pitch(samples: &[i32], rate: u32) -> f64 {
 #[test]
 fn video_soundtracks_convert_like_audio_files() {
     let dir = tmp("video-sound");
-    for (file, format) in [("video_opus.mp4", Format::Mp4), ("video_two_tracks.mkv", Format::Mkv), ("video_pcm.mov", Format::Mov)] {
+    for (file, format) in [
+        ("video_opus.mp4", Format::Mp4),
+        ("video_two_tracks.mkv", Format::Mkv),
+        ("video_pcm.mov", Format::Mov),
+        ("video_pcm.avi", Format::Avi),
+    ] {
         let src = fixture(file);
         assert_eq!(Format::detect(&src), Some(format), "{file}");
         let dst = dir.join(format!("{file}.wav"));
@@ -973,7 +978,8 @@ fn video_soundtracks_convert_like_audio_files() {
         let (info, samples, _) = read_all(&dst, Format::Wav, 16);
         let secs = samples.len() as f64 / info.channels as f64 / info.sample_rate as f64;
         assert!((secs - 0.5).abs() < 0.05, "{file}: {secs} s");
-        let p = pitch(&samples, info.sample_rate);
+        let first: Vec<i32> = samples.iter().step_by(info.channels as usize).copied().collect();
+        let p = pitch(&first, info.sample_rate);
         assert!((p - 440.0).abs() < 10.0, "{file}: the default (first) track's 440 Hz tone, got {p}");
     }
 }

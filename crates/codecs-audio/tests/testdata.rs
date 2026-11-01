@@ -69,3 +69,49 @@ fn converts_all_sample_audio_and_preserves_length() {
     eprintln!("{converted} conversions, {skipped} files without a decoder yet");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Every video in `testdata/video`: its soundtrack converts to WAV at its full length, or it
+/// fails with the reason (AAC, no sound).
+#[test]
+fn extracts_the_soundtracks_of_sample_videos() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/video");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        eprintln!("testdata/video missing; run scripts/fetch-testdata.sh");
+        return;
+    };
+    let out = std::env::temp_dir().join(format!("tf-video-testdata-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    let (cancel, progress, options) = (AtomicBool::new(false), |_: f32| {}, Options::default());
+    let ctx = ConvertCtx::new(&options, &cancel, &progress);
+    let mut failures = Vec::new();
+    let mut converted = 0;
+    for entry in entries.flatten() {
+        let src = entry.path();
+        let name = src.file_name().unwrap().to_string_lossy().into_owned();
+        let Some(from) = Format::detect(&src) else {
+            failures.push(format!("{name}: not recognised"));
+            continue;
+        };
+        if from.kind() != dotty_core::Kind::Video {
+            failures.push(format!("{name}: detected as {from}, not a video"));
+            continue;
+        }
+        let dst = out.join(format!("{name}.wav"));
+        match AudioConverter::default().convert(&src, &dst, from, Format::Wav, &ctx) {
+            Err(e) if name.contains("aac") => assert!(e.to_string().contains("AAC"), "{name}: {e}"),
+            Err(e) if name.contains("silent") => assert_eq!(e.to_string(), "this video has no sound"),
+            Err(e) => failures.push(format!("{name}: {e}")),
+            Ok(()) => {
+                converted += 1;
+                let want = frames(&src, from);
+                let got = frames(&dst, Format::Wav);
+                if (want.0, want.1) != (got.0, got.1) || want.2.abs_diff(got.2) > 1 {
+                    failures.push(format!("{name}: {want:?} → {got:?}"));
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(&out).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(converted >= 5, "only {converted} soundtracks converted");
+}

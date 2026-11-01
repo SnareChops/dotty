@@ -5,6 +5,7 @@
 //! format only has to be implemented once in each direction.
 
 mod aiff;
+pub mod avi;
 mod decode;
 pub mod edit;
 mod flac;
@@ -202,6 +203,7 @@ impl Default for AudioConverter {
             c.add_decoder(SymphoniaDecoder(f));
         }
         c.add_decoder(OggOpusDecoder);
+        c.add_decoder(avi::AviAudioDecoder);
         c.add_encoder(wav::WavEncoder);
         c.add_encoder(aiff::AiffEncoder);
         c.add_encoder(flac::FlacEncoder);

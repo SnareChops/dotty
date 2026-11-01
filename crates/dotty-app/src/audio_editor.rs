@@ -1326,7 +1326,7 @@ fn track_picker(ui: &mut egui::Ui, tracks: &[AudioTrack], current: Option<u32>) 
 
 /// A time text box: shows `value` until edited; returns a newly typed value on Enter or
 /// leaving the box.
-fn time_field(ui: &mut egui::Ui, text: &mut String, value: f64) -> Option<f64> {
+pub(crate) fn time_field(ui: &mut egui::Ui, text: &mut String, value: f64) -> Option<f64> {
     let id = ui.next_auto_id();
     let focused = ui.memory(|m| m.has_focus(id));
     if !focused {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/codecs-image", "crates/codecs-audio", "crates/dotty-core", "crates/dotty-app"]
+members = ["crates/codecs-image", "crates/codecs-audio", "crates/codecs-video", "crates/dotty-core", "crates/dotty-app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,4 +29,8 @@ opt-level = 3
 [profile.dev.package.resvg]
 opt-level = 3
 [profile.dev.package.ebur128]
+opt-level = 3
+[profile.dev.package.rav1d]
+opt-level = 3
+[profile.dev.package.filmcraft-vp9]
 opt-level = 3

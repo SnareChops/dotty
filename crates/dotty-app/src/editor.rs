@@ -13,9 +13,9 @@ use dotty_core::{Caption, CaptionFont, Captions, Drawing, EditOp, Edits, Format,
 
 /// Longest side the editor works at. Bigger images are edited scaled down and the edits are
 /// stretched back up, which keeps every click and slider drag fast.
-const MAX_SIDE: u32 = 3072;
+pub const MAX_SIDE: u32 = 3072;
 /// Pixels across all frames of an animation, so long ones fit in memory (~256 MB of RGBA).
-const MAX_PIXELS: u64 = 64 << 20;
+pub const MAX_PIXELS: u64 = 64 << 20;
 /// Height of the frame strip shown for animations and multi-page images.
 const STRIP: f32 = 64.0;
 /// Frame thumbnails built per screen refresh, so opening a long animation stays responsive.
@@ -55,7 +55,7 @@ pub struct Editor {
 }
 
 /// The decoded working copies (one per frame or page) and the first image's full size.
-type Loaded = Result<(Vec<Rgba8Image>, (u32, u32)), String>;
+pub type Loaded = Result<(Vec<Rgba8Image>, (u32, u32)), String>;
 
 enum State {
     /// Decoding in the background; edits made earlier wait for the image.
@@ -241,11 +241,23 @@ impl Editor {
         existing: Option<Arc<Edits>>,
     ) -> Self {
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        Self::open_with(ctx, entry, title, existing, move || {
+            edit::decode_for_edit(&path, from, &options, MAX_SIDE, MAX_PIXELS).map_err(|e| e.to_string())
+        })
+    }
+
+    /// Edit images made by `load` (on a background thread), e.g. frames picked from a video.
+    pub fn open_with(
+        ctx: &egui::Context,
+        entry: JobId,
+        title: String,
+        existing: Option<Arc<Edits>>,
+        load: impl FnOnce() -> Loaded + Send + 'static,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = edit::decode_for_edit(&path, from, &options, MAX_SIDE, MAX_PIXELS);
-            let _ = tx.send(result.map_err(|e| e.to_string()));
+            let _ = tx.send(load());
             ctx.request_repaint();
         });
         Self { entry, title, state: State::Loading(rx, existing) }

@@ -56,7 +56,7 @@ pub fn apply(img: &mut ImageData, edits: &Edits) {
                     f.image = f.image.crop_imm(x, y, w, h);
                 }
             }
-            EditOp::Audio(_) => {}
+            EditOp::Audio(_) | EditOp::Frames(_) => {}
         }
     }
 }
@@ -360,6 +360,12 @@ pub fn decode_for_edit(
     let (cancel, progress) = (AtomicBool::new(false), |_: f32| {});
     let ctx = ConvertCtx::new(options, &cancel, &progress);
     let img = decoder.decode(path, usize::MAX, &ctx)?;
+    Ok(fit_for_edit(img, from, options, max_side, max_pixels))
+}
+
+/// Decoded images as the editor's 8-bit working copies (capped like [`decode_for_edit`]),
+/// with the first image's real size. Videos' picked frames come in this way too.
+pub fn fit_for_edit(img: ImageData, from: Format, options: &Options, max_side: u32, max_pixels: u64) -> (Vec<RgbaImage>, (u32, u32)) {
     // Load caption fonts now, in the background, rather than on the first caption.
     crate::caption::fonts();
     let img = crate::color::for_encoder(img, false, from, options);
@@ -379,7 +385,7 @@ pub fn decode_for_edit(
             if rgba.dimensions() == (nw, nh) { rgba } else { image::imageops::resize(&rgba, nw, nh, FilterType::Triangle) }
         })
         .collect();
-    Ok((frames, (w, h)))
+    (frames, (w, h))
 }
 
 /// `mask` stretched to `w`×`h`.

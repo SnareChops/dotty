@@ -42,10 +42,11 @@ pub enum Format {
     Mov,
     Mkv,
     Webm,
+    Avi,
 }
 
 impl Format {
-    pub const ALL: [Format; 31] = [
+    pub const ALL: [Format; 32] = [
         Format::Png,
         Format::Jpeg,
         Format::Gif,
@@ -77,6 +78,7 @@ impl Format {
         Format::Mov,
         Format::Mkv,
         Format::Webm,
+        Format::Avi,
     ];
 
     pub fn kind(self) -> Kind {
@@ -86,7 +88,7 @@ impl Format {
                 Kind::Image
             }
             Wav | Flac | Mp3 | Ogg | Opus | Aiff | Caf | M4a | Mka | Mp2 => Kind::Audio,
-            Mp4 | Mov | Mkv | Webm => Kind::Video,
+            Mp4 | Mov | Mkv | Webm | Avi => Kind::Video,
         }
     }
 
@@ -124,6 +126,7 @@ impl Format {
             Format::Mov => "mov",
             Format::Mkv => "mkv",
             Format::Webm => "webm",
+            Format::Avi => "avi",
         }
     }
 
@@ -182,6 +185,7 @@ impl Format {
                 | Format::Mov
                 | Format::Mkv
                 | Format::Webm
+                | Format::Avi
         )
     }
 
@@ -217,6 +221,7 @@ impl Format {
             "mov" | "qt" => Format::Mov,
             "mkv" => Format::Mkv,
             "webm" => Format::Webm,
+            "avi" => Format::Avi,
             "mp2" | "mp1" | "mpa" | "m2a" => Format::Mp2,
             _ => return None,
         })
@@ -266,6 +271,8 @@ impl Format {
             Some(Format::Psd)
         } else if text.trim_start_matches('\u{feff}').trim_start().starts_with("<svg") {
             Some(Format::Svg)
+        } else if starts(b"RIFF") && at(8, b"AVI ") {
+            Some(Format::Avi)
         } else if starts(b"RIFF") && at(8, b"WAVE") {
             Some(Format::Wav)
         } else if starts(b"FORM") && (at(8, b"AIFF") || at(8, b"AIFC")) {
@@ -333,6 +340,7 @@ mod tests {
         assert_eq!(Format::sniff(b"\0\0\0\x14ftypqt  "), Some(Format::Mov));
         assert_eq!(Format::sniff(b"\0\0\0\x18ftypheic"), None);
         assert_eq!(Format::sniff(&[0x1A, 0x45, 0xDF, 0xA3, 0x9F]), Some(Format::Mkv));
+        assert_eq!(Format::sniff(b"RIFF\0\0\0\0AVI LIST"), Some(Format::Avi));
         assert_eq!(Format::sniff(b"FORM\0\0\0\0AIFFCOMM"), Some(Format::Aiff));
         assert_eq!(Format::sniff(b"P6\n4 4\n255\n"), Some(Format::Pnm));
         assert_eq!(Format::sniff(b"  <svg xmlns="), Some(Format::Svg));

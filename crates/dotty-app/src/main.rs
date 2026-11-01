@@ -3,10 +3,12 @@
 
 mod audio_editor;
 mod editor;
+mod frame_picker;
 mod player;
 
 use audio_editor::AudioEditor;
 use editor::{Editor, Outcome};
+use frame_picker::FramePicker;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
@@ -78,9 +80,14 @@ impl Entry {
 
     /// Which editor this entry opens: a video going to an audio format gets the audio
     /// editor for its soundtrack.
+    /// `Kind::Video` means the frame picker (a video going to an image format).
     fn edits_as(&self) -> Option<Kind> {
         match self.from.kind() {
-            Kind::Video => self.to.filter(|t| t.kind() == Kind::Audio).map(|_| Kind::Audio),
+            Kind::Video => match self.to?.kind() {
+                Kind::Audio => Some(Kind::Audio),
+                Kind::Image => Some(Kind::Video),
+                Kind::Video => None,
+            },
             k => Some(k),
         }
     }
@@ -113,6 +120,10 @@ type Probe = (JobId, bool);
 enum ActiveEditor {
     Image(Editor),
     Audio(AudioEditor),
+    /// Picking a video's frame(s) for an image target.
+    Frames(FramePicker),
+    /// Editing the frames picked from a video; the pick is saved with the picture edits.
+    VideoPicture(Editor, dotty_core::FrameSelection),
 }
 
 fn preset_from_str(s: &str) -> Preset {
@@ -143,6 +154,7 @@ impl App {
         let mut registry = Registry::new();
         codecs_image::register(&mut registry);
         codecs_audio::register(&mut registry);
+        codecs_video::register(&mut registry);
         let registry = Arc::new(registry);
 
         // Large files are memory-hungry (some encoders hold the whole stream), so don't
@@ -260,6 +272,10 @@ impl App {
                 });
                 ActiveEditor::Audio(AudioEditor::open(ctx, e.id, e.path.clone(), e.from, e.edits.clone(), output_channels))
             }
+            Some(Kind::Video) => {
+                let to = e.to.unwrap_or(Format::Png);
+                ActiveEditor::Frames(FramePicker::open(ctx, e.id, e.path.clone(), e.from, to, self.options.clone(), e.edits.clone()))
+            }
             _ => ActiveEditor::Image(Editor::open(ctx, e.id, e.path.clone(), e.from, self.options.clone(), e.edits.clone())),
         });
     }
@@ -296,6 +312,35 @@ impl App {
     fn show_editor(&mut self, ctx: &egui::Context) {
         match &mut self.editor {
             None => {}
+            Some(ActiveEditor::Frames(picker)) => match picker.show(ctx) {
+                frame_picker::Outcome::Open => {}
+                frame_picker::Outcome::Cancelled => self.editor = None,
+                frame_picker::Outcome::Done { edits, thumb } => {
+                    let id = picker.entry;
+                    self.editor = None;
+                    self.set_edits(ctx, id, edits, thumb);
+                }
+                frame_picker::Outcome::EditPicture { sel } => {
+                    let id = picker.entry;
+                    let Some(e) = self.entries.iter().find(|e| e.id == id) else { return };
+                    let (path, from, to, options) = (e.path.clone(), e.from, e.to.unwrap_or(Format::Png), self.options.clone());
+                    let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let editor = Editor::open_with(ctx, id, title, e.edits.clone(), move || frame_picker::load_for_editor(path, from, to, sel, options));
+                    self.editor = Some(ActiveEditor::VideoPicture(editor, sel));
+                }
+            },
+            Some(ActiveEditor::VideoPicture(editor, sel)) => match editor.show(ctx, &self.checker) {
+                Outcome::Open => {}
+                Outcome::Cancelled => self.editor = None,
+                Outcome::Done { edits, thumb } => {
+                    let (id, sel) = (editor.entry, *sel);
+                    self.editor = None;
+                    // The pick, then the picture edits that apply to the picked frames.
+                    let mut ops = vec![dotty_core::EditOp::Frames(sel)];
+                    ops.extend(edits.map(|e| e.ops).unwrap_or_default());
+                    self.set_edits(ctx, id, Some(Edits { ops }), thumb);
+                }
+            },
             Some(ActiveEditor::Image(editor)) => match editor.show(ctx, &self.checker) {
                 Outcome::Open => {}
                 Outcome::Cancelled => self.editor = None,
@@ -420,7 +465,7 @@ impl App {
     }
 
     fn supported_formats(&self, ui: &mut egui::Ui) {
-        for (kind, name) in [(Kind::Image, "Images"), (Kind::Audio, "Audio"), (Kind::Video, "Video (sound only for now)")] {
+        for (kind, name) in [(Kind::Image, "Images"), (Kind::Audio, "Audio"), (Kind::Video, "Video (to sound or pictures for now)")] {
             let list: Vec<String> = Format::ALL
                 .into_iter()
                 .filter(|f| f.kind() == kind && !self.registry.targets(*f).is_empty())
@@ -507,6 +552,11 @@ impl App {
                     });
                     if e.to != before && editable {
                         e.status = Status::Ready; // a new target means convert again
+                        // A video's soundtrack edits mean nothing for an image target and the
+                        // other way round: drop them when the kind of target changes.
+                        if e.from.kind() == Kind::Video && before.map(Format::kind) != e.to.map(Format::kind) {
+                            (e.edits, e.preview, e.edited_length) = (None, None, None);
+                        }
                     }
                     if e.editable() {
                         let audio = e.edits_as() == Some(Kind::Audio);
@@ -529,7 +579,9 @@ impl App {
                             });
                         }
                         let label = if e.edits.is_some() { "Edit •" } else { "Edit" };
-                        let help = if video {
+                        let help = if video && !audio {
+                            "Pick the frame (or the stretch for an animation), then edit the picture if you like"
+                        } else if video {
                             "Edit the soundtrack before converting: trim, fade, change speed or pitch, filter, add effects or change the volume"
                         } else if audio {
                             "Trim, fade, change speed or pitch, filter, reverse, add echo or reverb, or change the volume before converting"
@@ -996,7 +1048,7 @@ mod tests {
         let e = &app.entries[0];
         assert_eq!((e.from, e.from.kind()), (Format::Mkv, Kind::Video));
         assert_eq!(e.to, Some(Format::Mp3), "a video's sound goes to MP3 by default");
-        assert!(app.targets(e).iter().all(|t| t.kind() == Kind::Audio), "only sound can be written for now");
+        assert!(app.targets(e).iter().all(|t| t.kind() != Kind::Video), "sound or pictures only, so far");
         assert_eq!(e.edits_as(), Some(Kind::Audio), "Edit opens the audio editor on the soundtrack");
 
         app.convert_all();
@@ -1005,4 +1057,26 @@ mod tests {
         assert!(dir.join("clip.mp3").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn a_video_can_become_a_picture() {
+        let dir = std::env::temp_dir().join(format!("tf-app-video-picture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("clip.mkv");
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../codecs-audio/tests/fixtures/video_two_tracks.mkv"), &video).unwrap();
+        let mut app = app();
+        app.add_files([video]);
+        assert!(app.targets(&app.entries[0]).contains(&Format::Png));
+        app.entries[0].to = Some(Format::Png);
+        assert_eq!(app.entries[0].edits_as(), Some(Kind::Video), "Edit opens the frame picker");
+        app.convert_all();
+        wait_idle(&mut app);
+        if let Status::Failed(m) = &app.entries[0].status {
+            panic!("failed: {m}");
+        }
+        assert!(matches!(app.entries[0].status, Status::Done(..)));
+        assert_eq!(codecs_video::image::image_dimensions(dir.join("clip.png")).unwrap(), (64, 64));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
+

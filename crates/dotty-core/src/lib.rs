@@ -8,7 +8,7 @@ pub mod output;
 pub mod probe;
 pub mod registry;
 
-pub use edit::{AudioEdits, Caption, CaptionFont, Captions, Channels, Drawing, Echo, EditOp, Edits, Mask, Region, Reverb, Stroke, Volume};
+pub use edit::{AudioEdits, Caption, CaptionFont, Captions, Channels, Drawing, Echo, EditOp, Edits, FrameSelection, Mask, Region, Reverb, Stroke, Volume};
 pub use format::{Format, Kind};
 pub use jobs::{JobEvent, JobId, JobRequest, JobRunner};
 pub use registry::{ConvertCtx, Converter, Registry};

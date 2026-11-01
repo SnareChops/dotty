@@ -1,0 +1,16 @@
+[package]
+name = "codecs-video"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dotty-core = { version = "0.1.0", path = "../dotty-core" }
+codecs-audio = { version = "0.1.0", path = "../codecs-audio" }
+codecs-image = { version = "0.1.0", path = "../codecs-image" }
+# Same version and features as codecs-image, so they share one build.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff", "ico", "webp", "avif", "tga", "qoi", "pnm", "hdr", "exr", "dds"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["isomp4", "mkv"] }
+# AV1. Its asm needs nasm at build time (see PLAN.md, "nasm (open)"); pure Rust for now.
+rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+filmcraft-vp9 = "0.9.0"

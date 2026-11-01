@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 codecs-audio = { version = "0.1.0", path = "../codecs-audio" }
 codecs-image = { version = "0.1.0", path = "../codecs-image" }
+codecs-video = { version = "0.1.0", path = "../codecs-video" }
 eframe = { version = "0.37.0", features = ["persistence"] }
 rfd = "0.17.2"
 dotty-core = { version = "0.1.0", path = "../dotty-core" }

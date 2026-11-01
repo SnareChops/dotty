@@ -241,9 +241,19 @@ impl Converter for ImageConverter {
 
         let keep_wanted = multi_choice(encoder).is_some_and(|c| ctx.options.choice(to, &c) == "all");
         let max_frames = if keep_wanted || ctx.options.split_frames { usize::MAX } else { 1 };
-        let mut img = decoder.decode(src, max_frames, ctx)?;
+        let img = decoder.decode(src, max_frames, ctx)?;
         ctx.check_cancelled()?;
         (ctx.progress)(0.5);
+        self.write(img, from, to, dst, ctx)
+    }
+}
+
+impl ImageConverter {
+    /// Everything after decoding: metadata, editor edits, keeping or splitting several
+    /// frames as `to` allows, colour handling, encoding. Videos hand their frames in here.
+    pub fn write(&self, mut img: ImageData, from: Format, to: Format, dst: &Path, ctx: &ConvertCtx) -> Result<()> {
+        let encoder = self.encoder(to).ok_or(Error::NoRoute { from, to })?;
+        let keep_wanted = multi_choice(encoder).is_some_and(|c| ctx.options.choice(to, &c) == "all");
         if ctx.options.strip_metadata {
             img.exif = None;
             img.icc = None;
