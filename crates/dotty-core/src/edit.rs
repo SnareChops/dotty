@@ -78,8 +78,8 @@ pub enum EditOp {
 }
 
 /// Changes to an audio file. Unlike image edits these are a fixed set of knobs: the
-/// pipeline turns them into stages in a set order: trim, reverse, speed/pitch, filters,
-/// fades, echo, reverb, volume. Fades come before the effects so echoes and reverb ring out naturally.
+/// pipeline turns them into stages in a set order: trim, reverse, speed/pitch, channels,
+/// filters, fades, echo, reverb, volume. Fades come before the effects so echoes and reverb ring out naturally.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioEdits {
     /// Keep from here (seconds into the source).
@@ -94,6 +94,7 @@ pub struct AudioEdits {
     pub keep_pitch: bool,
     /// Pitch change in semitones (fractions are cents), −12 to +12, on top of any from speed.
     pub pitch: f32,
+    pub channels: Channels,
     /// Remove what's below this many Hz (rumble, hum), 12 dB/octave.
     pub low_cut: Option<f32>,
     /// Remove what's above this many Hz (hiss), 12 dB/octave.
@@ -115,6 +116,7 @@ impl Default for AudioEdits {
             speed: 1.0,
             keep_pitch: true,
             pitch: 0.0,
+            channels: Channels::Keep,
             low_cut: None,
             high_cut: None,
             echo: None,
@@ -124,6 +126,18 @@ impl Default for AudioEdits {
             fade_out: 0.0,
         }
     }
+}
+
+/// The channel layout the editor asks for (the output format's own channel setting still
+/// applies afterwards).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Channels {
+    Keep,
+    /// Mix everything down to one channel.
+    Mono,
+    /// Two channels: surround is folded down, mono is copied to both sides. `width` (0..1)
+    /// spreads a mono source out (pseudo-stereo); 0 is a plain copy.
+    Stereo { width: f32 },
 }
 
 /// Repeats of the sound, each quieter than the last.

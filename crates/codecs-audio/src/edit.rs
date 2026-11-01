@@ -1,7 +1,7 @@
 //! Audio edits as pipeline stages. The converter and the editor's preview build the same
 //! stages, so what plays in the editor is what gets written.
 //!
-//! Order: trim → reverse → speed/pitch → filters → fades → echo → reverb → volume (with a limiter). Fades
+//! Order: trim → reverse → speed/pitch → channels → filters → fades → echo → reverb → volume (with a limiter). Fades
 //! come before the effects so a fade-out lets echoes and reverb ring out naturally (and the
 //! short fades on cut points keep clicks out of them). Normalizing needs the level of the
 //! audio as it reaches the volume stage, so callers measure first ([`shape`] + [`measure`])
@@ -9,7 +9,7 @@
 
 use crate::stages::{Remix, Resample};
 use crate::{AudioConverter, AudioSource, StreamInfo, Tags};
-use dotty_core::{AudioEdits, Echo, Error, Format, Result, Reverb, Volume};
+use dotty_core::{AudioEdits, Channels, Echo, Error, Format, Result, Reverb, Volume};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -120,10 +120,22 @@ pub fn volume_gain(volume: Volume, measured: Option<&Measurement>) -> f32 {
     10f32.powf(db.clamp(MAX_CUT, MAX_BOOST) / 20.0)
 }
 
-/// Whether `gain` pushes peaks past [`CEILING`], so the limiter has to step in. Without a
-/// measurement any boost might.
-pub fn limits(gain: f32, measured: Option<&Measurement>) -> bool {
-    measured.map_or(gain > 1.0, |m| m.peak * gain > CEILING)
+/// Whether the limiter is armed for `gain`. Normalizing has a measurement, so it's armed only
+/// when the peak would pass [`CEILING`]. A plain gain change isn't measured (the converter
+/// reads the file once), so it's armed for any boost and for edits that can raise peaks
+/// (effects, widening). Armed or not, it changes nothing below the ceiling; the decision
+/// only depends on what both the converter and the editor know, so they always agree.
+pub fn limits(edits: &AudioEdits, gain: f32, measured: Option<&Measurement>) -> bool {
+    if edits.volume.measures() {
+        measured.is_none_or(|m| m.peak * gain > CEILING)
+    } else {
+        gain > 1.0 || raises_peaks(edits)
+    }
+}
+
+/// Edits that can push peaks above where the source had them.
+fn raises_peaks(edits: &AudioEdits) -> bool {
+    edits.echo.is_some() || edits.reverb.is_some() || matches!(edits.channels, Channels::Stereo { width } if width > 0.0)
 }
 
 /// Every stage before the volume: trim, reverse, filters, fades, effects. Measure this to
@@ -152,6 +164,14 @@ fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Pla
     if speed.to != src.info().sample_rate {
         src = Box::new(Repitch::new(src, speed.to)?);
     }
+    let channels = src.info().channels;
+    match edits.channels {
+        Channels::Keep => {}
+        Channels::Mono if channels != 1 => src = Box::new(Remix::new(src, 1)),
+        Channels::Stereo { width } if channels == 1 && width > 0.0 => src = Box::new(Widen::new(src, width)),
+        Channels::Stereo { .. } if channels != 2 => src = Box::new(Remix::new(src, 2)),
+        _ => {}
+    }
     let biquads = filters(edits, src.info().sample_rate);
     if !biquads.is_empty() {
         src = Box::new(Filters::new(src, biquads));
@@ -168,7 +188,7 @@ fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Pla
 /// The volume stage.
 fn with_volume<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured: Option<&Measurement>) -> Box<dyn AudioSource + 'a> {
     let gain = volume_gain(edits.volume, measured);
-    let limit = limits(gain, measured);
+    let limit = limits(edits, gain, measured);
     if gain != 1.0 || limit { Box::new(Gain::new(src, gain, limit)) } else { src }
 }
 
@@ -678,7 +698,7 @@ pub fn preview<'a>(
         Box::new(MemorySource::new(samples, info, from, Some(end)))
     };
     let mut chain = with_volume(after_pick(src, edits, &plan, plan.output_index(from, end))?, edits, measured);
-    if channels != info.channels {
+    if channels != chain.info().channels {
         chain = Box::new(Remix::new(chain, channels.clamp(1, 2)));
     }
     if rate != info.sample_rate {
@@ -883,6 +903,72 @@ impl<S: AudioSource> AudioSource for Stretch<S> {
             }
         }
         Ok(if self.out.is_empty() { None } else { Some(&self.out) })
+    }
+    fn end_note(&self) -> Option<String> {
+        self.inner.end_note()
+    }
+}
+
+/// Mono to pseudo-stereo by complementary comb filtering: a delayed copy, high-passed so the
+/// bass stays centred, is added to the left and subtracted from the right. The two sides
+/// differ (it sounds wider) but still add up to the original, so it plays back correctly
+/// in mono.
+struct Widen<S> {
+    inner: S,
+    info: StreamInfo,
+    amount: f32,
+    delay: Vec<f32>,
+    pos: usize,
+    high_pass: Biquad,
+    state: [f64; 2],
+    buf: Vec<f32>,
+}
+
+/// Delay of the widening copy, and the frequency below which it stays out.
+const WIDEN_DELAY: f64 = 0.012;
+const WIDEN_FROM_HZ: f32 = 300.0;
+
+impl<S: AudioSource> Widen<S> {
+    fn new(inner: S, width: f32) -> Self {
+        let mut info = inner.info().clone();
+        info.channels = 2;
+        let rate = info.sample_rate;
+        let len = ((WIDEN_DELAY * rate as f64) as usize).max(1);
+        Self {
+            inner,
+            info,
+            amount: width.clamp(0.0, 1.0) * 0.7,
+            delay: vec![0.0; len],
+            pos: 0,
+            high_pass: Biquad::new(WIDEN_FROM_HZ.min(rate as f32 * 0.4), rate, true),
+            state: [0.0; 2],
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl<S: AudioSource> AudioSource for Widen<S> {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+    fn tags(&self) -> &Tags {
+        self.inner.tags()
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        let Some(chunk) = self.inner.next_chunk()? else { return Ok(None) };
+        self.buf.clear();
+        let q = self.high_pass;
+        for &x in chunk {
+            let delayed = std::mem::replace(&mut self.delay[self.pos], x);
+            self.pos = (self.pos + 1) % self.delay.len();
+            let z = &mut self.state;
+            let y = q.b0 * delayed as f64 + z[0];
+            z[0] = q.b1 * delayed as f64 - q.a1 * y + z[1];
+            z[1] = q.b2 * delayed as f64 - q.a2 * y;
+            let side = self.amount * y as f32;
+            self.buf.extend([x + side, x - side]);
+        }
+        Ok(Some(&self.buf))
     }
     fn end_note(&self) -> Option<String> {
         self.inner.end_note()
@@ -1321,9 +1407,10 @@ mod tests {
         assert_eq!(plan.output_index(5000, 9000), 3999);
     }
 
+    /// A half-scale click (full scale would be trimmed by the limiter that effects arm).
     fn impulse(channels: u16, frames: usize) -> Arc<[f32]> {
         let mut v = vec![0.0; frames * channels as usize];
-        v[..channels as usize].fill(1.0);
+        v[..channels as usize].fill(0.5);
         v.into()
     }
 
@@ -1331,8 +1418,8 @@ mod tests {
     fn echo_repeats_at_the_delay_and_rings_on_past_the_end() {
         let e = AudioEdits { echo: Some(Echo { delay_ms: 100.0, feedback: 0.5, mix: 0.8 }), ..Default::default() };
         let out = drain(apply(Box::new(MemorySource::new(impulse(1, 50), &info(1, 50), 0, None)), &e, None).unwrap());
-        assert_eq!(out[0], 1.0);
-        assert!((out[100] - 0.8).abs() < 1e-6 && (out[200] - 0.4).abs() < 1e-6 && (out[300] - 0.2).abs() < 1e-6);
+        assert_eq!(out[0], 0.5);
+        assert!((out[100] - 0.4).abs() < 1e-6 && (out[200] - 0.2).abs() < 1e-6 && (out[300] - 0.1).abs() < 1e-6);
         assert!(out[1..100].iter().all(|&s| s == 0.0));
         // Stops once the repeats are below −80 dB, rather than running to the cap.
         let last = out.iter().rposition(|s| s.abs() > 0.0).unwrap();
@@ -1343,7 +1430,7 @@ mod tests {
     fn a_long_echo_gap_is_not_mistaken_for_the_end() {
         let e = AudioEdits { echo: Some(Echo { delay_ms: 2000.0, feedback: 0.3, mix: 0.5 }), ..Default::default() };
         let out = drain(apply(Box::new(MemorySource::new(impulse(1, 10), &info(1, 10), 0, None)), &e, None).unwrap());
-        assert!((out[2000] - 0.5).abs() < 1e-6 && (out[4000] - 0.15).abs() < 1e-6, "second repeat survives the 2 s gap");
+        assert!((out[2000] - 0.25).abs() < 1e-6 && (out[4000] - 0.075).abs() < 1e-6, "second repeat survives the 2 s gap");
     }
 
     #[test]
@@ -1435,5 +1522,68 @@ mod tests {
         let r = Plan { reverse: true, ..p };
         assert_eq!((r.output_index(4999, 5000), r.output_index(1000, 5000)), (0, 1999));
         assert_eq!(r.source_frame(0, 5000), 4999);
+    }
+
+    fn render_channels(samples: Vec<f32>, channels: u16, rate: u32, edits: &AudioEdits) -> (u16, Vec<f32>) {
+        let i = info_at(rate, channels, samples.len() / channels as usize);
+        let src = apply(Box::new(MemorySource::new(samples.into(), &i, 0, None)), edits, None).unwrap();
+        let ch = src.info().channels;
+        (ch, drain(src))
+    }
+
+    #[test]
+    fn mono_to_stereo_widens_but_still_adds_up_to_the_original() {
+        let rate = 48_000;
+        let input: Vec<f32> = sine(3000.0, 0.3, rate, 0.5).iter().zip(sine(55.0, 0.3, rate, 0.5)).map(|(a, b)| a + b).collect();
+        let copy = AudioEdits { channels: Channels::Stereo { width: 0.0 }, ..Default::default() };
+        let (ch, out) = render_channels(input.clone(), 1, rate, &copy);
+        assert_eq!(ch, 2);
+        assert!(out.as_chunks::<2>().0.iter().zip(&input).all(|(f, &x)| f[0] == x && f[1] == x), "width 0 is a plain copy");
+
+        let wide = AudioEdits { channels: Channels::Stereo { width: 1.0 }, ..Default::default() };
+        let (_, out) = render_channels(input.clone(), 1, rate, &wide);
+        let frames = out.as_chunks::<2>().0;
+        assert_eq!(frames.len(), input.len());
+        assert!(frames.iter().zip(&input).all(|(f, &x)| ((f[0] + f[1]) / 2.0 - x).abs() < 1e-5), "mono-compatible");
+        let side: Vec<f32> = frames.iter().map(|f| (f[0] - f[1]) / 2.0).collect();
+        let at = |freq: f32| {
+            // Side-signal level at one frequency (correlate with a sine and cosine).
+            let (mut c, mut q) = (0.0f32, 0.0f32);
+            for (n, s) in side.iter().enumerate().skip(4800) {
+                let ph = n as f32 * freq * std::f32::consts::TAU / rate as f32;
+                c += s * ph.cos();
+                q += s * ph.sin();
+            }
+            (c * c + q * q).sqrt() * 2.0 / (side.len() - 4800) as f32
+        };
+        assert!(at(3000.0) > 0.1, "highs spread: {}", at(3000.0));
+        assert!(at(55.0) < 0.01, "bass stays centred: {}", at(55.0));
+    }
+
+    #[test]
+    fn channel_settings_mix_down_and_fold_up() {
+        let stereo: Vec<f32> = (0..2000).flat_map(|i| [i as f32 / 4000.0, -(i as f32) / 4000.0]).collect();
+        let (ch, out) = render_channels(stereo.clone(), 2, 1000, &AudioEdits { channels: Channels::Mono, ..Default::default() });
+        assert_eq!((ch, out.len()), (1, 2000));
+        assert!(out.iter().all(|&s| s.abs() < 1e-6), "opposite channels cancel in the mix");
+        // Stereo on a stereo source changes nothing, whatever the width says.
+        let (ch, out) = render_channels(stereo.clone(), 2, 1000, &AudioEdits { channels: Channels::Stereo { width: 0.8 }, ..Default::default() });
+        assert_eq!((ch, &out), (2, &stereo));
+    }
+
+    #[test]
+    fn the_limiter_decision_does_not_depend_on_having_a_measurement() {
+        let m = Measurement { peak: 0.5, loudness: -20.0 };
+        for e in [
+            AudioEdits::default(),
+            AudioEdits { reverb: Some(Reverb::HALL), ..Default::default() },
+            AudioEdits { channels: Channels::Stereo { width: 0.5 }, ..Default::default() },
+            AudioEdits { volume: Volume::Gain(3.0), ..Default::default() },
+            AudioEdits { volume: Volume::Gain(-3.0), ..Default::default() },
+        ] {
+            let g = volume_gain(e.volume, None);
+            assert_eq!(limits(&e, g, None), limits(&e, g, Some(&m)), "{e:?}");
+        }
+        assert!(!limits(&AudioEdits::default(), 1.0, None), "untouched audio is never limited");
     }
 }

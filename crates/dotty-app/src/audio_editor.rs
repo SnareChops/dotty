@@ -5,7 +5,7 @@
 use crate::player::{Player, Request};
 use codecs_audio::StreamInfo;
 use codecs_audio::edit::{CEILING, Measurement, Plan, decode_all, limits, measure_memory, volume_gain};
-use dotty_core::{AudioEdits, EditOp, Edits, Format, JobId, Reverb, Volume};
+use dotty_core::{AudioEdits, Channels, EditOp, Edits, Format, JobId, Reverb, Volume};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -336,7 +336,7 @@ impl Session {
     fn volume(&self) -> (f32, bool) {
         let m = self.measurement();
         let g = volume_gain(self.edits.volume, m);
-        (g, limits(g, m))
+        (g, limits(&self.edits, g, m))
     }
 
     /// Collect a finished measurement, and start one when the edits it depends on changed
@@ -803,6 +803,48 @@ impl Session {
                 e.pitch = 0.0;
             }
         });
+        self.channel_controls(ui);
+    }
+
+    fn channel_controls(&mut self, ui: &mut egui::Ui) {
+        let source = self.info.channels;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Channels");
+            let e = &mut self.edits;
+            let mut width = match e.channels {
+                Channels::Stereo { width } => width,
+                _ => 0.0,
+            };
+            let label = match (source, e.channels) {
+                (1, Channels::Stereo { .. }) => "Mono → stereo",
+                (_, Channels::Stereo { .. }) => "Stereo",
+                (_, Channels::Mono) => "Mono",
+                (_, Channels::Keep) => "Keep",
+            };
+            let stereo_help = if source == 1 {
+                "Copy the mono sound to both sides, so echo and reverb can spread out; Width makes it sound wider"
+            } else {
+                "Two channels (surround is folded down to stereo)"
+            };
+            egui::ComboBox::from_id_salt("channels").selected_text(label).show_ui(ui, |ui| {
+                if ui.selectable_label(e.channels == Channels::Keep, "Keep").on_hover_text("As in the source (the output format's channel setting still applies)").clicked() {
+                    e.channels = Channels::Keep;
+                }
+                if ui.selectable_label(e.channels == Channels::Mono, "Mono").on_hover_text("Mix everything down to one channel").clicked() {
+                    e.channels = Channels::Mono;
+                }
+                let stereo = matches!(e.channels, Channels::Stereo { .. });
+                if ui.selectable_label(stereo, if source == 1 { "Mono → stereo" } else { "Stereo" }).on_hover_text(stereo_help).clicked() && !stereo {
+                    e.channels = Channels::Stereo { width };
+                }
+            });
+            if source == 1 && matches!(e.channels, Channels::Stereo { .. }) {
+                ui.add(egui::Slider::new(&mut width, 0.0..=1.0).text("width").fixed_decimals(2)).on_hover_text(
+                    "0 puts the same sound on both sides. More spreads it out (pseudo-stereo); it still sounds right played back in mono, and the bass stays in the middle.",
+                );
+                e.channels = Channels::Stereo { width };
+            }
+        });
     }
 
     fn effect_controls(&mut self, ui: &mut egui::Ui) {
@@ -893,7 +935,8 @@ impl Session {
                         text += &format!(" → {:+.1} dB", 20.0 * gain.log10());
                     }
                     ui.weak(text).on_hover_text("Measured with every other change applied, before the volume change");
-                    if limited {
+                    // Armed isn't the same as working: say so only when it will turn peaks down.
+                    if limited && m.peak * gain > CEILING {
                         ui.colored_label(ui.visuals().warn_fg_color, "⚠ peaks limited").on_hover_text(
                             "This would push peaks past 0 dB, so a limiter turns them down just enough to keep them from clipping.",
                         );
@@ -1175,7 +1218,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut s = session(5);
         s.edits.volume = Volume::Peak(-6.0);
-        assert_eq!(s.volume(), (1.0, false), "no measurement yet: unchanged");
+        assert_eq!(s.volume(), (1.0, true), "no measurement yet: unchanged level, limiter armed to be safe");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while s.measurement().is_none() {
             s.update_measurement(&ctx, false);

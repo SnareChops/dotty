@@ -894,3 +894,28 @@ fn speed_and_pitch_change_the_written_length() {
     assert!(frames.abs_diff(14_700) <= 2, "0.5 s at 1.5× is 1/3 s: {frames} frames");
     assert_eq!(info.sample_rate, 44_100, "pitch shifting doesn't change the file's rate");
 }
+
+#[test]
+fn the_editor_channel_setting_comes_before_the_output_one() {
+    let dir = tmp("chan");
+    let src = dir.join("mono.wav");
+    make_wav(&src, 1, 8000, 16, &signal(1, 4000, 16), &Tags::default());
+    let edits = dotty_core::Edits {
+        ops: vec![dotty_core::EditOp::Audio(dotty_core::AudioEdits {
+            channels: dotty_core::Channels::Stereo { width: 0.5 },
+            ..Default::default()
+        })],
+    };
+    let cancel = AtomicBool::new(false);
+    let progress = |_: f32| {};
+    for (pick, want) in [("keep", 2), ("mono", 1)] {
+        let mut options = Options::default();
+        options.set_choice(Format::Wav, &CHANNELS, pick);
+        let dst = dir.join(format!("out-{pick}.wav"));
+        let ctx = ConvertCtx::new(&options, &cancel, &progress).with_edits(Some(&edits));
+        AudioConverter::default().convert(&src, &dst, Format::Wav, Format::Wav, &ctx).unwrap();
+        let (info, _, _) = read_all(&dst, Format::Wav, 16);
+        assert_eq!(info.channels, want, "output channels set to {pick}");
+        assert!(ctx.take_notes().is_empty(), "no mixed-down note for a choice the user made");
+    }
+}

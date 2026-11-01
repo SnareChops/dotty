@@ -255,17 +255,19 @@ impl Converter for AudioConverter {
             if let Some(a) = audio_edits {
                 chain = edit::apply(chain, a, measured.as_ref())?;
             }
+            // Edits may have changed the layout (the editor's channel setting).
+            let have = chain.info().channels;
             let wanted = match ctx.options.choice(to, &CHANNELS) {
                 "mono" => 1,
                 "stereo" => 2,
-                _ => info.channels,
+                _ => have,
             };
             let channels = wanted.min(encoder.max_channels());
-            if channels != info.channels {
+            if channels != have {
                 let channels = channels.min(2);
                 if channels != wanted {
                     let layout = if channels == 1 { "mono" } else { "stereo" };
-                    ctx.note(format!("{}-channel audio was mixed down to {layout}", info.channels));
+                    ctx.note(format!("{have}-channel audio was mixed down to {layout}"));
                 }
                 chain = Box::new(Remix::new(chain, channels));
             }
