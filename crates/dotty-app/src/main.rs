@@ -1,8 +1,11 @@
 // No console window behind the app on Windows (debug builds keep it for logs).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio_editor;
 mod editor;
+mod player;
 
+use audio_editor::AudioEditor;
 use editor::{Editor, Outcome};
 use eframe::egui;
 use std::path::PathBuf;
@@ -62,13 +65,15 @@ struct Entry {
     status: Status,
     /// Changes made in the editor, applied when converting.
     edits: Option<Arc<Edits>>,
-    /// What the edited image looks like, for the row.
+    /// What the edited image (or audio waveform) looks like, for the row.
     preview: Option<egui::TextureHandle>,
+    /// Length of the edited audio, in seconds.
+    edited_length: Option<f64>,
 }
 
 impl Entry {
-    fn editable_image(&self) -> bool {
-        self.from.kind() == Kind::Image
+    fn editable(&self) -> bool {
+        matches!(self.from.kind(), Kind::Image | Kind::Audio)
     }
 
     /// Whether the edits made parts of the image transparent.
@@ -84,9 +89,14 @@ struct App {
     next_id: JobId,
     options: Options,
     notice: Option<String>,
-    editor: Option<Editor>,
+    editor: Option<ActiveEditor>,
     /// Shows transparency behind edited images.
     checker: egui::TextureHandle,
+}
+
+enum ActiveEditor {
+    Image(Editor),
+    Audio(AudioEditor),
 }
 
 fn preset_from_str(s: &str) -> Preset {
@@ -140,7 +150,7 @@ impl App {
             let to = self.registry.targets(from).into_iter().next();
             let multi = self.registry.multi_image(&path, from);
             self.next_id += 1;
-            self.entries.push(Entry { id: self.next_id, path, from, multi, to, status: Status::Ready, edits: None, preview: None });
+            self.entries.push(Entry { id: self.next_id, path, from, multi, to, status: Status::Ready, edits: None, preview: None, edited_length: None });
         }
         self.notice = (skipped > 0).then(|| format!("{skipped} file(s) skipped: unsupported type"));
     }
@@ -193,7 +203,10 @@ impl App {
 
     fn open_editor(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.entries[i];
-        self.editor = Some(Editor::open(ctx, e.id, e.path.clone(), e.from, self.options.clone(), e.edits.clone()));
+        self.editor = Some(match e.from.kind() {
+            Kind::Audio => ActiveEditor::Audio(AudioEditor::open(ctx, e.id, e.path.clone(), e.from, e.edits.clone())),
+            _ => ActiveEditor::Image(Editor::open(ctx, e.id, e.path.clone(), e.from, self.options.clone(), e.edits.clone())),
+        });
     }
 
     /// Store what the editor produced (`None` clears the edits).
@@ -214,6 +227,7 @@ impl App {
             None => {
                 e.edits = None;
                 e.preview = None;
+                e.edited_length = None;
                 if e.to == Some(e.from) {
                     e.to = self.registry.targets(e.from).into_iter().next();
                 }
@@ -225,15 +239,30 @@ impl App {
     }
 
     fn show_editor(&mut self, ctx: &egui::Context) {
-        let Some(editor) = &mut self.editor else { return };
-        match editor.show(ctx, &self.checker) {
-            Outcome::Open => {}
-            Outcome::Cancelled => self.editor = None,
-            Outcome::Done { edits, thumb } => {
-                let id = editor.entry;
-                self.editor = None;
-                self.set_edits(ctx, id, edits, thumb);
-            }
+        match &mut self.editor {
+            None => {}
+            Some(ActiveEditor::Image(editor)) => match editor.show(ctx, &self.checker) {
+                Outcome::Open => {}
+                Outcome::Cancelled => self.editor = None,
+                Outcome::Done { edits, thumb } => {
+                    let id = editor.entry;
+                    self.editor = None;
+                    self.set_edits(ctx, id, edits, thumb);
+                }
+            },
+            Some(ActiveEditor::Audio(editor)) => match editor.show(ctx) {
+                audio_editor::Outcome::Open => {}
+                audio_editor::Outcome::Cancelled => self.editor = None,
+                audio_editor::Outcome::Done { edits, thumb, length } => {
+                    let id = editor.entry;
+                    self.editor = None;
+                    let edited = edits.is_some();
+                    self.set_edits(ctx, id, edits, thumb);
+                    if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                        e.edited_length = edited.then_some(length);
+                    }
+                }
+            },
         }
     }
 
@@ -424,11 +453,17 @@ impl App {
                     if e.to != before && editable {
                         e.status = Status::Ready; // a new target means convert again
                     }
-                    if e.editable_image() {
+                    if e.editable() {
+                        let audio = e.from.kind() == Kind::Audio;
+                        let backing = (!audio).then_some(checker);
                         if let Some(tex) = &e.preview {
-                            let resp = thumbnail(ui, checker, tex, 22.0)
+                            let side = if audio { 44.0 } else { 22.0 };
+                            let resp = thumbnail(ui, backing, tex, side)
                                 .on_hover_ui(|ui| {
-                                    thumbnail(ui, checker, tex, editor::THUMB_SIDE as f32);
+                                    thumbnail(ui, backing, tex, if audio { audio_editor::THUMB[0] as f32 } else { editor::THUMB_SIDE as f32 });
+                                    if let Some(len) = e.edited_length {
+                                        ui.label(format!("Length after editing: {}", audio_editor::fmt_time(len)));
+                                    }
                                     ui.weak("Right-click to discard the edits");
                                 });
                             resp.context_menu(|ui| {
@@ -438,7 +473,12 @@ impl App {
                             });
                         }
                         let label = if e.edits.is_some() { "Edit •" } else { "Edit" };
-                        if ui.add_enabled(editable, egui::Button::new(label)).on_hover_text("Remove the background, draw, add text or crop before converting").clicked() {
+                        let help = if audio {
+                            "Trim or add fades before converting"
+                        } else {
+                            "Remove the background, draw, add text or crop before converting"
+                        };
+                        if ui.add_enabled(editable, egui::Button::new(label)).on_hover_text(help).clicked() {
                             edit = Some(i);
                         }
                     }
@@ -503,11 +543,14 @@ impl App {
 }
 
 /// An image over the transparency checkerboard, scaled to `side` points on its longest side.
-fn thumbnail(ui: &mut egui::Ui, checker: &egui::TextureHandle, tex: &egui::TextureHandle, side: f32) -> egui::Response {
+/// `checker` goes behind images that may be transparent; audio waveforms go on the row itself.
+fn thumbnail(ui: &mut egui::Ui, checker: Option<&egui::TextureHandle>, tex: &egui::TextureHandle, side: f32) -> egui::Response {
     let size = tex.size_vec2();
     let size = size * (side / size.x.max(size.y));
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    editor::paint_checker(ui.painter(), checker, rect);
+    if let Some(checker) = checker {
+        editor::paint_checker(ui.painter(), checker, rect);
+    }
     ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
     resp
 }

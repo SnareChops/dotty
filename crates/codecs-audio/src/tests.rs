@@ -782,3 +782,34 @@ fn chained_ogg_streams_are_joined_or_flagged() {
     assert_eq!(read_f32(&dir.join("ac.wav"), Format::Wav).1.len() / 2, 44100);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn edits_trim_and_fade_when_resaving_in_the_same_format() {
+    let dir = tmp("edit");
+    let (src, dst) = (dir.join("in.wav"), dir.join("out.wav"));
+    let samples = signal(2, 16_000, 16);
+    make_wav(&src, 2, 8000, 16, &samples, &Tags::default());
+    let edits = dotty_core::Edits {
+        ops: vec![dotty_core::EditOp::Audio(dotty_core::AudioEdits {
+            trim_start: 0.5,
+            trim_end: Some(1.5),
+            fade_in: 0.1,
+            fade_out: 0.0,
+        })],
+    };
+    let cancel = AtomicBool::new(false);
+    let last = std::sync::Mutex::new(0.0f32);
+    let progress = |p: f32| *last.lock().unwrap() = p;
+    let options = Options::default();
+    let ctx = ConvertCtx::new(&options, &cancel, &progress).with_edits(Some(&edits));
+    AudioConverter::default().convert(&src, &dst, Format::Wav, Format::Wav, &ctx).unwrap();
+    assert_eq!(*last.lock().unwrap(), 1.0);
+
+    let (info, out, _) = read_all(&dst, Format::Wav, 16);
+    assert_eq!(info.total_frames, Some(8000));
+    assert_eq!(out.len(), 8000 * 2);
+    assert_eq!(out[0], 0, "fade-in starts silent");
+    // Past the fade-in and away from the 5 ms cut fade at the end: untouched.
+    assert_eq!(&out[2000..15_000], &samples[4000 * 2 + 2000..4000 * 2 + 15_000]);
+    assert!(out[out.len() - 2].abs() < 200, "cut point fades out");
+}

@@ -56,6 +56,7 @@ pub fn apply(img: &mut ImageData, edits: &Edits) {
                     f.image = f.image.crop_imm(x, y, w, h);
                 }
             }
+            EditOp::Audio(_) => {}
         }
     }
 }

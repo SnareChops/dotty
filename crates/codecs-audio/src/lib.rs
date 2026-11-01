@@ -6,6 +6,7 @@
 
 mod aiff;
 mod decode;
+pub mod edit;
 mod flac;
 mod id3;
 mod mp3;
@@ -211,11 +212,11 @@ impl AudioConverter {
 }
 
 impl Converter for AudioConverter {
+    /// Includes `(f, f)`: re-saving an edited file in its own format.
     fn routes(&self) -> Vec<(Format, Format)> {
         self.decoders
             .iter()
             .flat_map(|d| self.encoders.iter().map(move |e| (d.format(), e.format())))
-            .filter(|(a, b)| a != b)
             .collect()
     }
 
@@ -234,7 +235,13 @@ impl Converter for AudioConverter {
         let file = File::create(dst).map_err(|source| Error::Io { path: dst.into(), source })?;
         let mut out = BufWriter::new(file);
         {
-            let mut chain: Box<dyn AudioSource + '_> = Box::new(Metered::new(&mut decoded, ctx, encoder.read_share()));
+            let audio_edits = ctx.edits.and_then(|e| e.audio()).filter(|a| !a.is_noop());
+            let plan = audio_edits.map(|a| edit::Plan::new(a, info.sample_rate, info.total_frames));
+            let metered = Metered::new(&mut decoded, ctx, encoder.read_share()).until(plan.and_then(|p| p.end));
+            let mut chain: Box<dyn AudioSource + '_> = Box::new(metered);
+            if let Some(a) = audio_edits {
+                chain = edit::apply(chain, a);
+            }
             let wanted = match ctx.options.choice(to, &CHANNELS) {
                 "mono" => 1,
                 "stereo" => 2,

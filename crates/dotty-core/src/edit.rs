@@ -1,4 +1,4 @@
-//! Pixel edits made in the editor before converting. They travel with a job and the
+//! Edits made in the editor before converting (pixels for images, stages for audio). They travel with a job and the
 //! converter applies them between decoding and encoding, so the source is never touched.
 
 use std::fmt;
@@ -49,6 +49,14 @@ impl Edits {
         })
     }
 
+    /// The audio edits, if any.
+    pub fn audio(&self) -> Option<&AudioEdits> {
+        self.ops.iter().find_map(|op| match op {
+            EditOp::Audio(a) => Some(a),
+            _ => None,
+        })
+    }
+
     /// Whether the edits make parts of the image transparent.
     pub fn erases(&self) -> bool {
         self.ops.iter().any(|op| matches!(op, EditOp::Erase { .. }))
@@ -65,6 +73,50 @@ pub enum EditOp {
     Text(Captions),
     /// Keep only this part of every image (animation frames are cropped alike).
     Crop(Region),
+    /// Trim, fades and other changes to an audio file.
+    Audio(AudioEdits),
+}
+
+/// Changes to an audio file. Unlike image edits these are a fixed set of knobs: the
+/// pipeline turns them into stages in a set order (trim, then fades).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioEdits {
+    /// Keep from here (seconds into the source).
+    pub trim_start: f64,
+    /// Keep up to here (seconds into the source); `None` = to the end.
+    pub trim_end: Option<f64>,
+    /// Fade-in and fade-out lengths in seconds of output.
+    pub fade_in: f64,
+    pub fade_out: f64,
+}
+
+impl Default for AudioEdits {
+    fn default() -> Self {
+        Self { trim_start: 0.0, trim_end: None, fade_in: 0.0, fade_out: 0.0 }
+    }
+}
+
+impl AudioEdits {
+    /// Whether these change nothing.
+    pub fn is_noop(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The kept range in frames of a stream at `rate` Hz that is `total` frames long
+    /// (if known). Always at least one frame wide when the source has any.
+    pub fn trim_frames(&self, rate: u32, total: Option<u64>) -> (u64, Option<u64>) {
+        let at = |s: f64| (s.max(0.0) * rate as f64).round() as u64;
+        let mut start = at(self.trim_start);
+        let mut end = self.trim_end.map(at);
+        if let Some(t) = total {
+            start = start.min(t.saturating_sub(1));
+            end = Some(end.unwrap_or(t).min(t));
+        }
+        if let Some(e) = &mut end {
+            *e = (*e).max(start + 1);
+        }
+        (start, end)
+    }
 }
 
 /// Captions placed on an image `of_width`×`of_height` (the editor's working size); scaled
