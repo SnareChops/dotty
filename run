@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Build and run Transformer. Usage: ./run [command] [args...]
+set -euo pipefail
+cd "$(dirname "$0")"
+
+usage() {
+    cat <<'EOF'
+Usage: ./run [command] [files...]
+
+  (none)     build and launch the app in release mode (default)
+  dev        build and launch a debug build
+  build      release build only
+  windows    release build for 64-bit Windows into dist/ (needs mingw-w64-gcc and
+             `rustup target add x86_64-pc-windows-gnu`)
+  test       run all workspace tests (release; includes real-file tests if testdata/ exists)
+  check      clippy + unit tests, without the slow real-file tests
+  data       download sample files into testdata/
+  clean      remove build output
+
+Any other arguments (e.g. file paths) are passed through to the app:
+  ./run photo.png song.flac
+EOF
+}
+
+cmd="${1:-release}"
+case "$cmd" in
+    -h|--help|help) usage ;;
+    release) shift || true; cargo run --release -p transformer-app -- "$@" ;;
+    dev)     shift; cargo run -p transformer-app -- "$@" ;;
+    build)   cargo build --release -p transformer-app ;;
+    windows)
+        cargo build --release -p transformer-app --target x86_64-pc-windows-gnu
+        mkdir -p dist
+        cp target/x86_64-pc-windows-gnu/release/transformer-app.exe dist/Transformer-win64.exe
+        echo "dist/Transformer-win64.exe"
+        ;;
+    test)
+        [ -d testdata ] || ./scripts/fetch-testdata.sh
+        cargo test --workspace --release
+        ;;
+    check)
+        cargo clippy --workspace --all-targets
+        cargo test --workspace --release --lib --bins
+        ;;
+    data)    ./scripts/fetch-testdata.sh ;;
+    clean)   cargo clean ;;
+    *)       cargo run --release -p transformer-app -- "$@" ;;
+esac
