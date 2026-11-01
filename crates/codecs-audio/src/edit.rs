@@ -1,7 +1,7 @@
 //! Audio edits as pipeline stages. The converter and the editor's preview build the same
 //! stages, so what plays in the editor is what gets written.
 //!
-//! Order: trim → reverse → filters → fades → echo → reverb → volume (with a limiter). Fades
+//! Order: trim → reverse → speed/pitch → filters → fades → echo → reverb → volume (with a limiter). Fades
 //! come before the effects so a fade-out lets echoes and reverb ring out naturally (and the
 //! short fades on cut points keep clicks out of them). Normalizing needs the level of the
 //! audio as it reaches the volume stage, so callers measure first ([`shape`] + [`measure`])
@@ -29,13 +29,15 @@ const MAX_BOOST: f32 = 40.0;
 const MAX_CUT: f32 = -60.0;
 
 /// [`AudioEdits`] resolved to frames for a stream at one rate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Plan {
     /// First source frame kept.
     pub start: u64,
     /// One past the last source frame kept, if known.
     pub end: Option<u64>,
     pub reverse: bool,
+    /// Source frames per output frame.
+    pub speed: f64,
     /// Fade lengths in output frames, including the short ones on cut points.
     pub fade_in: u64,
     pub fade_out: u64,
@@ -59,7 +61,8 @@ impl Plan {
         if cut_last {
             fade_out = fade_out.max(cut_fade);
         }
-        Self { start, end, reverse: edits.reverse, fade_in, fade_out }
+        let speed = edits.speed.clamp(AudioEdits::MIN_SPEED, AudioEdits::MAX_SPEED);
+        Self { start, end, reverse: edits.reverse, speed, fade_in, fade_out }
     }
 
     /// Gain at output frame `i` of an output `len` frames long.
@@ -77,7 +80,19 @@ impl Plan {
 
     /// Where kept source frame `frame` lands in the output, when the kept part ends at `end`.
     pub fn output_index(&self, frame: u64, end: u64) -> u64 {
-        if self.reverse { end.saturating_sub(frame + 1) } else { frame.saturating_sub(self.start) }
+        let from_start = if self.reverse { end.saturating_sub(frame + 1) } else { frame.saturating_sub(self.start) };
+        (from_start as f64 / self.speed) as u64
+    }
+
+    /// The source frame heard at output frame `i` (the inverse of [`Plan::output_index`]).
+    pub fn source_frame(&self, i: u64, end: u64) -> u64 {
+        let from_start = (i as f64 * self.speed) as u64;
+        if self.reverse { end.saturating_sub(from_start + 1).max(self.start) } else { (self.start + from_start).min(end.saturating_sub(1)) }
+    }
+
+    /// Output length of `kept` source frames, before any effect tail.
+    pub fn output_len(&self, kept: u64) -> u64 {
+        ((kept as f64 / self.speed).round() as u64).max(1)
     }
 }
 
@@ -113,7 +128,7 @@ pub fn limits(gain: f32, measured: Option<&Measurement>) -> bool {
 
 /// Every stage before the volume: trim, reverse, filters, fades, effects. Measure this to
 /// normalize.
-pub fn shape<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn AudioSource + 'a> {
+pub fn shape<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Result<Box<dyn AudioSource + 'a>> {
     let info = src.info();
     let plan = Plan::new(edits, info.sample_rate, info.total_frames);
     let mut src = src;
@@ -128,8 +143,15 @@ pub fn shape<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn 
 
 /// The stages after the kept part is picked (and reversed): filters, fades (for output
 /// starting `offset` frames in), effects.
-fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Plan, offset: u64) -> Box<dyn AudioSource + 'a> {
+fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Plan, offset: u64) -> Result<Box<dyn AudioSource + 'a>> {
     let mut src = src;
+    let speed = speed_plan(edits, src.info().sample_rate);
+    if speed.stretch != 1.0 {
+        src = Box::new(Stretch::new(src, speed.stretch));
+    }
+    if speed.to != src.info().sample_rate {
+        src = Box::new(Repitch::new(src, speed.to)?);
+    }
     let biquads = filters(edits, src.info().sample_rate);
     if !biquads.is_empty() {
         src = Box::new(Filters::new(src, biquads));
@@ -140,7 +162,7 @@ fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Pla
     if edits.echo.is_some() || edits.reverb.is_some() {
         src = Box::new(Effects::new(src, edits));
     }
-    src
+    Ok(src)
 }
 
 /// The volume stage.
@@ -152,8 +174,8 @@ fn with_volume<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured:
 
 /// Applies `edits` to a stream starting at its first frame (the converter's case).
 /// `measured` is [`measure`] of [`shape`] of the same stream, needed when normalizing.
-pub fn apply<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured: Option<&Measurement>) -> Box<dyn AudioSource + 'a> {
-    with_volume(shape(src, edits), edits, measured)
+pub fn apply<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured: Option<&Measurement>) -> Result<Box<dyn AudioSource + 'a>> {
+    Ok(with_volume(shape(src, edits)?, edits, measured))
 }
 
 /// Reads `src` to the end and measures it. Stops early if `cancel` is set.
@@ -655,7 +677,7 @@ pub fn preview<'a>(
     } else {
         Box::new(MemorySource::new(samples, info, from, Some(end)))
     };
-    let mut chain = with_volume(after_pick(src, edits, &plan, plan.output_index(from, end)), edits, measured);
+    let mut chain = with_volume(after_pick(src, edits, &plan, plan.output_index(from, end))?, edits, measured);
     if channels != info.channels {
         chain = Box::new(Remix::new(chain, channels.clamp(1, 2)));
     }
@@ -663,6 +685,255 @@ pub fn preview<'a>(
         chain = Box::new(Resample::new(chain, rate)?);
     }
     Ok(chain)
+}
+
+/// How a speed and pitch change is carried out: time-stretch by `stretch` (output length over
+/// input length, pitch untouched), then resample to `to` Hz while still calling it the
+/// original rate, which scales both pitch and length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpeedPlan {
+    pub stretch: f64,
+    pub to: u32,
+}
+
+/// Stretches within this of 1 are skipped (tape-style speed changes, where rounding the
+/// resample rate leaves a hair of stretch that WSOLA would only make worse).
+const NO_STRETCH: f64 = 0.005;
+
+pub fn speed_plan(edits: &AudioEdits, rate: u32) -> SpeedPlan {
+    let speed = edits.speed.clamp(AudioEdits::MIN_SPEED, AudioEdits::MAX_SPEED);
+    let pitch = (if edits.keep_pitch { 1.0 } else { speed }) * 2f64.powf(edits.pitch.clamp(-12.0, 12.0) as f64 / 12.0);
+    let to = if (pitch - 1.0).abs() < 1e-9 {
+        rate
+    } else {
+        // A multiple of 25 Hz keeps the resampler's FFTs small (they scale with the rates
+        // divided by their common factor); the pitch is then within about a cent.
+        let exact = rate as f64 / pitch;
+        let step = if rate.is_multiple_of(25) { 25.0 } else { 1.0 };
+        (((exact / step).round() * step) as u32).max(25)
+    };
+    // The pitch the rounded rate gives, and the stretch that makes the length come out right.
+    let actual = rate as f64 / to as f64;
+    let mut stretch = actual / speed;
+    if (stretch - 1.0).abs() < NO_STRETCH {
+        stretch = 1.0;
+    }
+    SpeedPlan { stretch, to }
+}
+
+/// Time-stretch by WSOLA (waveform-similarity overlap-add): the output is built from
+/// Hann-windowed input segments at half-overlap; each segment is taken from near where the
+/// stretch says it should come from, nudged (within ±10 ms) to where the input best matches
+/// how the previous segment would have carried on, so the waveforms line up and don't
+/// phase-cancel. Pitch is untouched. Good on speech; dense music can sound a bit warbly,
+/// and extreme stretches smear or stutter.
+struct Stretch<S> {
+    inner: S,
+    info: StreamInfo,
+    ch: usize,
+    /// Output length over input length.
+    stretch: f64,
+    /// Segment length, half of it (the output hop), and the search range.
+    n: usize,
+    hop: usize,
+    search: usize,
+    window: Vec<f32>,
+    /// Buffered input, interleaved and mixed to mono (for matching); `base` is the absolute
+    /// frame number of their first frame.
+    input: Vec<f32>,
+    mono: Vec<f32>,
+    base: u64,
+    read: u64,
+    ended: bool,
+    /// Segments placed so far, and where the last one came from.
+    step: u64,
+    prev: u64,
+    /// Overlap-add accumulator, `n` frames.
+    ola: Vec<f32>,
+    out: Vec<f32>,
+    emitted: u64,
+}
+
+impl<S: AudioSource> Stretch<S> {
+    fn new(inner: S, stretch: f64) -> Self {
+        let mut info = inner.info().clone();
+        let ch = info.channels.max(1) as usize;
+        let n = ((info.sample_rate as f64 * 0.04) as usize).max(64) & !1;
+        let hop = n / 2;
+        let window = (0..n).map(|i| (0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / n as f64).cos()) as f32).collect();
+        info.total_frames = info.total_frames.map(|t| (t as f64 * stretch).round() as u64);
+        Self {
+            inner,
+            info,
+            ch,
+            stretch,
+            n,
+            hop,
+            search: n / 4,
+            window,
+            input: Vec::new(),
+            mono: Vec::new(),
+            base: 0,
+            read: 0,
+            ended: false,
+            step: 0,
+            prev: 0,
+            ola: vec![0.0; n * ch],
+            out: Vec::new(),
+            emitted: 0,
+        }
+    }
+
+    /// Read until the input reaches frame `upto` (or ends).
+    fn fill(&mut self, upto: u64) -> Result<()> {
+        while !self.ended && self.read < upto {
+            match self.inner.next_chunk()? {
+                Some(chunk) => {
+                    self.input.extend_from_slice(chunk);
+                    self.mono.extend(chunk.chunks_exact(self.ch).map(|f| f.iter().sum::<f32>() / self.ch as f32));
+                    self.read += (chunk.len() / self.ch) as u64;
+                }
+                None => self.ended = true,
+            }
+        }
+        Ok(())
+    }
+
+    fn mono_at(&self, frame: u64) -> f32 {
+        frame.checked_sub(self.base).and_then(|i| self.mono.get(i as usize)).copied().unwrap_or(0.0)
+    }
+
+    /// How alike the input at `cand` is to the natural continuation of the previous segment,
+    /// comparing every `stride`-th frame over half a segment (normalized cross-correlation).
+    fn similarity(&self, cand: u64, stride: usize) -> f32 {
+        let target = self.prev + self.hop as u64;
+        let (mut dot, mut energy) = (0.0f32, 1e-9f32);
+        for i in (0..self.hop).step_by(stride) {
+            let a = self.mono_at(cand + i as u64);
+            dot += a * self.mono_at(target + i as u64);
+            energy += a * a;
+        }
+        dot / energy.sqrt()
+    }
+
+    /// Where the next segment comes from.
+    fn pick(&self, nominal: u64) -> u64 {
+        if self.step == 0 {
+            return 0;
+        }
+        let lo = nominal.saturating_sub(self.search as u64);
+        let hi = nominal + self.search as u64;
+        // Coarse search on every 8th position and frame, then refine around the best.
+        let best_of = |range: &mut dyn Iterator<Item = u64>, stride: usize| {
+            range.map(|c| (c, self.similarity(c, stride))).fold((nominal, f32::NEG_INFINITY), |b, x| if x.1 > b.1 { x } else { b }).0
+        };
+        let coarse = best_of(&mut (lo..=hi).step_by(8), 8);
+        best_of(&mut (coarse.saturating_sub(7).max(lo)..=(coarse + 7).min(hi)), 2)
+    }
+
+    /// Length of the output, once the input length is known.
+    fn target(&self) -> Option<u64> {
+        self.ended.then(|| (self.read as f64 * self.stretch).round() as u64)
+    }
+}
+
+impl<S: AudioSource> AudioSource for Stretch<S> {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+    fn tags(&self) -> &Tags {
+        self.inner.tags()
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        let (n, hop, ch) = (self.n, self.hop, self.ch);
+        self.out.clear();
+        while self.out.len() < CHUNK * ch {
+            if self.target().is_some_and(|t| self.emitted >= t) {
+                break;
+            }
+            let nominal = (self.step as f64 * hop as f64 / self.stretch).round() as u64;
+            self.fill(nominal.max(self.prev + hop as u64) + (self.search + n) as u64)?;
+            let pos = self.pick(nominal);
+            for i in 0..n {
+                // The first segment starts at full level, not faded in by its window.
+                let w = if self.step == 0 && i < hop { 1.0 } else { self.window[i] };
+                let at = (pos + i as u64).checked_sub(self.base).map(|f| f as usize * ch);
+                for c in 0..ch {
+                    let s = at.and_then(|a| self.input.get(a + c)).copied().unwrap_or(0.0);
+                    self.ola[i * ch + c] += w * s;
+                }
+            }
+            let mut take = hop as u64;
+            if let Some(t) = self.target() {
+                take = take.min(t - self.emitted);
+            }
+            self.out.extend_from_slice(&self.ola[..take as usize * ch]);
+            self.emitted += take;
+            self.ola.copy_within(hop * ch.., 0);
+            self.ola[(n - hop) * ch..].fill(0.0);
+            self.prev = pos;
+            self.step += 1;
+            // Forget input no segment can reach any more.
+            let keep_from = self.prev.min(nominal.saturating_sub(self.search as u64));
+            let drop = keep_from.saturating_sub(self.base) as usize;
+            if drop > 1 << 16 {
+                self.input.drain(..drop * ch);
+                self.mono.drain(..drop);
+                self.base += drop as u64;
+            }
+        }
+        Ok(if self.out.is_empty() { None } else { Some(&self.out) })
+    }
+    fn end_note(&self) -> Option<String> {
+        self.inner.end_note()
+    }
+}
+
+/// Resamples to `to` Hz but keeps calling it the original rate, so it plays back at a
+/// different pitch and speed (a tape running faster or slower).
+struct Repitch<S> {
+    inner: S,
+    info: StreamInfo,
+    resampler: crate::resample::StreamResampler,
+    buf: Vec<f32>,
+    finished: bool,
+}
+
+impl<S: AudioSource> Repitch<S> {
+    fn new(inner: S, to: u32) -> Result<Self> {
+        let mut info = inner.info().clone();
+        let resampler = crate::resample::StreamResampler::new(info.sample_rate, to, info.channels as usize)?;
+        info.total_frames = info.total_frames.map(|t| (t as f64 * to as f64 / info.sample_rate as f64).ceil() as u64);
+        Ok(Self { inner, info, resampler, buf: Vec::new(), finished: false })
+    }
+}
+
+impl<S: AudioSource> AudioSource for Repitch<S> {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+    fn tags(&self) -> &Tags {
+        self.inner.tags()
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        while !self.finished {
+            self.buf.clear();
+            match self.inner.next_chunk()? {
+                Some(chunk) => self.resampler.push(chunk, &mut self.buf)?,
+                None => {
+                    self.resampler.finish(&mut self.buf)?;
+                    self.finished = true;
+                }
+            }
+            if !self.buf.is_empty() {
+                return Ok(Some(&self.buf));
+            }
+        }
+        Ok(None)
+    }
+    fn end_note(&self) -> Option<String> {
+        self.inner.end_note()
+    }
 }
 
 /// One per-frame effect with a memory, so it keeps sounding after its input stops.
@@ -868,7 +1139,7 @@ impl<S: AudioSource> AudioSource for Effects<S> {
 
 /// Measures the editor's in-memory copy as the volume stage will see it.
 pub fn measure_memory(samples: Arc<[f32]>, info: &StreamInfo, edits: &AudioEdits, cancel: &AtomicBool) -> Result<Measurement> {
-    measure(shape(Box::new(MemorySource::new(samples, info, 0, None)), edits), Some(cancel))
+    measure(shape(Box::new(MemorySource::new(samples, info, 0, None)), edits)?, Some(cancel))
 }
 
 /// Decode a whole file into memory for the editor. Fails if it's longer than `max_secs`.
@@ -930,7 +1201,7 @@ mod tests {
         let samples: Arc<[f32]> = vec![1.0; 9000].into();
         let mut i = info(1, 9000);
         i.total_frames = None;
-        let plan = Plan { start: 0, end: None, reverse: false, fade_in: 1000, fade_out: 2000 };
+        let plan = Plan { start: 0, end: None, reverse: false, speed: 1.0, fade_in: 1000, fade_out: 2000 };
         let out = drain(Fade::new(MemorySource::new(samples, &i, 0, None), &plan, 0));
         assert_eq!(out.len(), 9000);
         assert!(out[0] < 1e-3 && out[8999] < 1e-3);
@@ -954,7 +1225,7 @@ mod tests {
         let samples: Arc<[f32]> = vec![0.5; 4000].into();
         let i = info(1, 4000);
         let e = AudioEdits { trim_start: 0.5, fade_in: 1.0, ..Default::default() };
-        let full = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None));
+        let full = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None).unwrap());
         let part = drain(preview(samples, &i, &e, None, 1000, 1, 1000).unwrap());
         assert_eq!(full.len(), 3500);
         assert_eq!(&full[500..], &part[..]);
@@ -973,7 +1244,7 @@ mod tests {
         let samples: Arc<[f32]> = samples.into();
         let cancel = AtomicBool::new(false);
         let m = edits.volume.measures().then(|| measure_memory(samples.clone(), &i, edits, &cancel).unwrap());
-        drain(apply(Box::new(MemorySource::new(samples, &i, 0, None)), edits, m.as_ref()))
+        drain(apply(Box::new(MemorySource::new(samples, &i, 0, None)), edits, m.as_ref()).unwrap())
     }
 
     fn rms(v: &[f32]) -> f32 {
@@ -1037,7 +1308,7 @@ mod tests {
         let samples = ramp(2, 10_000);
         let i = info(2, 10_000);
         let e = AudioEdits { trim_start: 1.0, trim_end: Some(9.0), reverse: true, fade_out: 0.5, ..Default::default() };
-        let full = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None));
+        let full = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None).unwrap());
         assert_eq!(full.len(), 8000 * 2);
         // The cut at 9 s is heard first, so it gets the short cut fade; the 0.5 s fade-out ends at 1 s.
         let plan = Plan::new(&e, 1000, Some(10_000));
@@ -1059,7 +1330,7 @@ mod tests {
     #[test]
     fn echo_repeats_at_the_delay_and_rings_on_past_the_end() {
         let e = AudioEdits { echo: Some(Echo { delay_ms: 100.0, feedback: 0.5, mix: 0.8 }), ..Default::default() };
-        let out = drain(apply(Box::new(MemorySource::new(impulse(1, 50), &info(1, 50), 0, None)), &e, None));
+        let out = drain(apply(Box::new(MemorySource::new(impulse(1, 50), &info(1, 50), 0, None)), &e, None).unwrap());
         assert_eq!(out[0], 1.0);
         assert!((out[100] - 0.8).abs() < 1e-6 && (out[200] - 0.4).abs() < 1e-6 && (out[300] - 0.2).abs() < 1e-6);
         assert!(out[1..100].iter().all(|&s| s == 0.0));
@@ -1071,7 +1342,7 @@ mod tests {
     #[test]
     fn a_long_echo_gap_is_not_mistaken_for_the_end() {
         let e = AudioEdits { echo: Some(Echo { delay_ms: 2000.0, feedback: 0.3, mix: 0.5 }), ..Default::default() };
-        let out = drain(apply(Box::new(MemorySource::new(impulse(1, 10), &info(1, 10), 0, None)), &e, None));
+        let out = drain(apply(Box::new(MemorySource::new(impulse(1, 10), &info(1, 10), 0, None)), &e, None).unwrap());
         assert!((out[2000] - 0.5).abs() < 1e-6 && (out[4000] - 0.15).abs() < 1e-6, "second repeat survives the 2 s gap");
     }
 
@@ -1081,7 +1352,7 @@ mod tests {
         let samples: Arc<[f32]> = sine(440.0, 0.5, rate, 0.5).into_iter().flat_map(|s| [s, s]).collect();
         let i = info_at(rate, 2, samples.len() / 2);
         let e = AudioEdits { reverb: Some(Reverb::HALL), fade_out: 0.1, ..Default::default() };
-        let out = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None));
+        let out = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None).unwrap());
         let n = samples.len();
         assert!(out.len() > n + rate as usize * 2, "a hall rings for seconds: {} extra frames", (out.len() - n) / 2);
         assert!(out.len() < n + rate as usize * 2 * MAX_TAIL as usize);
@@ -1092,5 +1363,77 @@ mod tests {
         // Preview from the start is the same render.
         let p = drain(preview(samples, &i, &e, None, 0, 2, rate).unwrap());
         assert_eq!(p, out);
+    }
+
+    /// Frequency from upward zero crossings over the middle half.
+    fn freq(v: &[f32], rate: u32) -> f32 {
+        let mid = &v[v.len() / 4..v.len() * 3 / 4];
+        let ups = mid.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        ups as f32 * rate as f32 / mid.len() as f32
+    }
+
+    fn rms_mid(v: &[f32]) -> f32 {
+        let mid = &v[v.len() / 4..v.len() * 3 / 4];
+        (mid.iter().map(|s| s * s).sum::<f32>() / mid.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn speed_plans_split_into_stretch_and_resample() {
+        let p = |speed, keep_pitch, pitch| speed_plan(&AudioEdits { speed, keep_pitch, pitch, ..Default::default() }, 48_000);
+        assert_eq!(p(2.0, false, 0.0), SpeedPlan { stretch: 1.0, to: 24_000 }, "tape: resample only");
+        assert_eq!(p(2.0, true, 0.0), SpeedPlan { stretch: 0.5, to: 48_000 }, "keep pitch: stretch only");
+        assert_eq!(p(1.0, true, 12.0), SpeedPlan { stretch: 2.0, to: 24_000 }, "octave up at the same speed");
+        assert_eq!(p(1.0, true, 0.0), SpeedPlan { stretch: 1.0, to: 48_000 });
+        // A semitone: the rate is rounded to 25 Hz, within ~1 cent, and the stretch makes up the length.
+        let s = p(1.0, true, 1.0);
+        assert_eq!(s.to % 25, 0);
+        let cents = 1200.0 * (48_000.0 / s.to as f64).log2();
+        assert!((cents - 100.0).abs() < 1.0, "{cents}");
+        assert!((s.stretch / (48_000.0 / s.to as f64) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn time_stretch_keeps_pitch_and_level_and_hits_the_length() {
+        let rate = 16_000;
+        let input = sine(440.0, 0.5, rate, 1.0);
+        for speed in [AudioEdits::MIN_SPEED, 0.5, 0.8, 1.25, 2.0, AudioEdits::MAX_SPEED] {
+            let e = AudioEdits { speed, ..Default::default() };
+            let out = render(input.clone(), rate, &e);
+            let want = (input.len() as f64 / speed).round() as usize;
+            assert!(out.len().abs_diff(want) <= 1, "speed {speed}: {} frames, wanted {want}", out.len());
+            let f = freq(&out, rate);
+            assert!((f - 440.0).abs() < 8.0, "speed {speed}: {f} Hz");
+            let level = rms_mid(&out) / rms_mid(&input);
+            assert!((level - 1.0).abs() < 0.1, "speed {speed}: level {level} (segments cancelling?)");
+        }
+        // The very start comes through untouched rather than faded in by the window.
+        let out = render(input.clone(), rate, &AudioEdits { speed: 0.5, ..Default::default() });
+        assert!(out[..200].iter().zip(&input).all(|(a, b)| (a - b).abs() < 1e-6));
+    }
+
+    #[test]
+    fn tape_speed_and_pitch_shift_move_the_frequency() {
+        let rate = 16_000;
+        let input = sine(440.0, 0.5, rate, 1.0);
+        let tape = render(input.clone(), rate, &AudioEdits { speed: 2.0, keep_pitch: false, ..Default::default() });
+        assert!(tape.len().abs_diff(8000) <= 1 && (freq(&tape, rate) - 880.0).abs() < 10.0);
+        let up = render(input.clone(), rate, &AudioEdits { pitch: 12.0, ..Default::default() });
+        assert!(up.len().abs_diff(16_000) <= 2, "{}", up.len());
+        assert!((freq(&up, rate) - 880.0).abs() < 10.0, "{}", freq(&up, rate));
+        let down = render(input.clone(), rate, &AudioEdits { pitch: -7.0, speed: 1.5, ..Default::default() });
+        assert!(down.len().abs_diff(10_667) <= 2, "{}", down.len());
+        let want = 440.0 * 2f32.powf(-7.0 / 12.0);
+        assert!((freq(&down, rate) - want).abs() < 6.0, "{} vs {want}", freq(&down, rate));
+    }
+
+    #[test]
+    fn output_positions_follow_the_speed() {
+        let e = AudioEdits { trim_start: 1.0, trim_end: Some(5.0), speed: 2.0, ..Default::default() };
+        let p = Plan::new(&e, 1000, Some(10_000));
+        assert_eq!((p.output_index(3000, 5000), p.output_len(4000)), (1000, 2000));
+        assert_eq!(p.source_frame(1000, 5000), 3000);
+        let r = Plan { reverse: true, ..p };
+        assert_eq!((r.output_index(4999, 5000), r.output_index(1000, 5000)), (0, 1999));
+        assert_eq!(r.source_frame(0, 5000), 4999);
     }
 }

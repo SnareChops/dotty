@@ -869,3 +869,28 @@ fn effect_tails_make_the_written_file_longer() {
     let peak = out.iter().map(|s| s.unsigned_abs()).max().unwrap() as f32 / 32768.0;
     assert!((20.0 * peak.log10() + 1.0).abs() < 0.05, "normalized after the effects: {peak}");
 }
+
+#[test]
+fn speed_and_pitch_change_the_written_length() {
+    let dir = tmp("speed");
+    let (src, dst) = (dir.join("in.wav"), dir.join("out.wav"));
+    make_wav(&src, 2, 44_100, 16, &signal(2, 44_100, 16), &Tags::default());
+    let edits = dotty_core::Edits {
+        ops: vec![dotty_core::EditOp::Audio(dotty_core::AudioEdits {
+            trim_end: Some(0.5),
+            speed: 1.5,
+            pitch: 3.0,
+            fade_out: 0.05,
+            ..Default::default()
+        })],
+    };
+    let cancel = AtomicBool::new(false);
+    let progress = |_: f32| {};
+    let options = Options::default();
+    let ctx = ConvertCtx::new(&options, &cancel, &progress).with_edits(Some(&edits));
+    AudioConverter::default().convert(&src, &dst, Format::Wav, Format::Wav, &ctx).unwrap();
+    let (info, _, _) = read_all(&dst, Format::Wav, 16);
+    let frames = info.total_frames.unwrap();
+    assert!(frames.abs_diff(14_700) <= 2, "0.5 s at 1.5× is 1/3 s: {frames} frames");
+    assert_eq!(info.sample_rate, 44_100, "pitch shifting doesn't change the file's rate");
+}

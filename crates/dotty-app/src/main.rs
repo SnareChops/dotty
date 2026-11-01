@@ -474,7 +474,7 @@ impl App {
                         }
                         let label = if e.edits.is_some() { "Edit •" } else { "Edit" };
                         let help = if audio {
-                            "Trim, fade, filter, reverse, add echo or reverb, or change the volume before converting"
+                            "Trim, fade, change speed or pitch, filter, reverse, add echo or reverb, or change the volume before converting"
                         } else {
                             "Remove the background, draw, add text or crop before converting"
                         };

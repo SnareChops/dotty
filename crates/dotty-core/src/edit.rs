@@ -78,8 +78,8 @@ pub enum EditOp {
 }
 
 /// Changes to an audio file. Unlike image edits these are a fixed set of knobs: the
-/// pipeline turns them into stages in a set order: trim, reverse, filters, fades, echo,
-/// reverb, volume. Fades come before the effects so echoes and reverb ring out naturally.
+/// pipeline turns them into stages in a set order: trim, reverse, speed/pitch, filters,
+/// fades, echo, reverb, volume. Fades come before the effects so echoes and reverb ring out naturally.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioEdits {
     /// Keep from here (seconds into the source).
@@ -88,6 +88,12 @@ pub struct AudioEdits {
     pub trim_end: Option<f64>,
     /// Play the kept part backwards.
     pub reverse: bool,
+    /// Playback speed, 0.15× to 4×.
+    pub speed: f64,
+    /// Keep the pitch when changing speed (time-stretch); off = tape-style, pitch follows speed.
+    pub keep_pitch: bool,
+    /// Pitch change in semitones (fractions are cents), −12 to +12, on top of any from speed.
+    pub pitch: f32,
     /// Remove what's below this many Hz (rumble, hum), 12 dB/octave.
     pub low_cut: Option<f32>,
     /// Remove what's above this many Hz (hiss), 12 dB/octave.
@@ -106,6 +112,9 @@ impl Default for AudioEdits {
             trim_start: 0.0,
             trim_end: None,
             reverse: false,
+            speed: 1.0,
+            keep_pitch: true,
+            pitch: 0.0,
             low_cut: None,
             high_cut: None,
             echo: None,
@@ -176,6 +185,9 @@ impl Volume {
 }
 
 impl AudioEdits {
+    pub const MIN_SPEED: f64 = 0.15;
+    pub const MAX_SPEED: f64 = 4.0;
+
     /// Whether these change nothing.
     pub fn is_noop(&self) -> bool {
         *self == Self::default()

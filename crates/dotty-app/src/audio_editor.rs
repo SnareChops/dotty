@@ -1,5 +1,5 @@
 //! The audio editor: a modal over the file list for quick changes before a conversion
-//! (trim, reverse, filters, fades, echo, reverb, volume). It decodes the file into memory, plays a preview through the same stages
+//! (trim, reverse, speed, pitch, filters, fades, echo, reverb, volume). It decodes the file into memory, plays a preview through the same stages
 //! the converter uses, and produces [`Edits`] for the job, so the source is never changed.
 
 use crate::player::{Player, Request};
@@ -262,9 +262,16 @@ impl Session {
         (p.start, p.end.unwrap_or(self.total))
     }
 
-    fn kept_secs(&self) -> f64 {
+    /// Length of the result in seconds (after speed changes, before any effect tail).
+    fn result_secs(&self) -> f64 {
         let (a, b) = self.kept();
-        (b - a) as f64 / self.rate()
+        self.plan().output_len(b - a) as f64 / self.rate()
+    }
+
+    /// Where the playhead is in the result, in seconds.
+    fn result_position(&self) -> f64 {
+        let (_, b) = self.kept();
+        self.plan().output_index(self.position().clamp(self.kept().0, b - 1), b) as f64 / self.rate()
     }
 
     fn set_trim(&mut self, start: f64, end: f64) {
@@ -278,7 +285,7 @@ impl Session {
     }
 
     fn clamp_fades(&mut self) {
-        let len = self.kept_secs();
+        let len = self.result_secs();
         self.edits.fade_in = self.edits.fade_in.clamp(0.0, len);
         self.edits.fade_out = self.edits.fade_out.clamp(0.0, len - self.edits.fade_in);
     }
@@ -302,7 +309,7 @@ impl Session {
 
     fn set_fade_side(&mut self, left: bool, secs: f64) {
         let (l, r) = self.fade_sides();
-        let secs = secs.clamp(0.0, (self.kept_secs() - if left { r } else { l }).max(0.0));
+        let secs = secs.clamp(0.0, (self.result_secs() - if left { r } else { l }).max(0.0));
         let fade_in_side = left != self.edits.reverse;
         if fade_in_side {
             self.edits.fade_in = secs;
@@ -422,7 +429,7 @@ impl Session {
             if ui.toggle_value(&mut self.looping, "🔁 Loop").on_hover_text("Play the kept part over and over (L)").changed() && playing {
                 self.play_from(self.position());
             }
-            ui.monospace(format!("{} / {}", fmt_time(self.position() as f64 / self.rate()), fmt_time(self.kept_secs())));
+            ui.monospace(format!("{} / {}", fmt_time(self.result_position()), fmt_time(self.result_secs())));
             ui.separator();
             if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("↶")).on_hover_text("Undo (Ctrl+Z)").clicked() {
                 self.undo();
@@ -525,8 +532,9 @@ impl Session {
         let x_start = self.frame_to_x(rect, kept_a as f64);
         let x_end = self.frame_to_x(rect, kept_b as f64);
         let (left, right) = self.fade_sides();
-        let x_fade_left = self.frame_to_x(rect, (kept_a as f64 + left * rate).min(kept_b as f64));
-        let x_fade_right = self.frame_to_x(rect, (kept_b as f64 - right * rate).max(kept_a as f64));
+        let speed = self.plan().speed;
+        let x_fade_left = self.frame_to_x(rect, (kept_a as f64 + left * rate * speed).min(kept_b as f64));
+        let x_fade_right = self.frame_to_x(rect, (kept_b as f64 - right * rate * speed).max(kept_a as f64));
         let grip_y = rect.top() + 8.0;
         let grip = |x: f32| egui::pos2(x, grip_y);
         let hit = |pos: egui::Pos2| -> Option<Drag> {
@@ -566,8 +574,9 @@ impl Session {
             match drag {
                 Drag::Start => self.set_trim(secs.min(b - 1.0 / rate), b),
                 Drag::End => self.set_trim(a, secs.max(a + 1.0 / rate)),
-                Drag::FadeLeft => self.set_fade_side(true, secs - a),
-                Drag::FadeRight => self.set_fade_side(false, b - secs),
+                // Fades are in output time.
+                Drag::FadeLeft => self.set_fade_side(true, (secs - a) / speed),
+                Drag::FadeRight => self.set_fade_side(false, (b - secs) / speed),
                 Drag::New(anchor) => {
                     let anchor = anchor as f64 / rate;
                     self.set_trim(anchor.min(secs), anchor.max(secs));
@@ -605,13 +614,14 @@ impl Session {
         let plan = self.plan();
         let (kept_a, kept_b) = self.kept();
         let kept_len = kept_b - kept_a;
+        let out_len = plan.output_len(kept_len);
         let (vol, limited) = self.volume();
         // What a sample sounds like after fades and volume (filters aren't drawn).
         let level = |s: f32, f: u64| -> f32 {
             if !(kept_a..kept_b).contains(&f) {
                 return s;
             }
-            let v = s * plan.gain(plan.output_index(f, kept_b), kept_len) * vol;
+            let v = s * plan.gain(plan.output_index(f, kept_b), out_len) * vol;
             if limited { v.clamp(-CEILING, CEILING) } else { v }
         };
         let visuals = ui.visuals().clone();
@@ -685,20 +695,22 @@ impl Session {
         let env_y = |g: f32| rect.top() + 8.0 + (1.0 - g) * (rect.height() - 16.0);
         let env = egui::Stroke::new(1.5, visuals.warn_fg_color);
         let (left_frames, right_frames) = if plan.reverse { (plan.fade_out, plan.fade_in) } else { (plan.fade_in, plan.fade_out) };
-        for (from, to) in [(kept_a, kept_a + left_frames.min(kept_len)), (kept_b.saturating_sub(right_frames.min(kept_len)), kept_b)] {
+        // Fade lengths are output frames; the waveform is in source frames.
+        let on_source = |frames: u64| ((frames as f64 * plan.speed) as u64).min(kept_len);
+        for (from, to) in [(kept_a, kept_a + on_source(left_frames)), (kept_b.saturating_sub(on_source(right_frames)), kept_b)] {
             if to > from {
                 let points: Vec<egui::Pos2> = (0..=48)
                     .map(|k| {
                         let f = (from + (to - from) * k / 48).min(kept_b - 1);
-                        egui::pos2(self.frame_to_x(rect, f as f64), env_y(plan.gain(plan.output_index(f, kept_b), kept_len)))
+                        egui::pos2(self.frame_to_x(rect, f as f64), env_y(plan.gain(plan.output_index(f, kept_b), out_len)))
                     })
                     .collect();
                 painter.add(egui::Shape::line(points, env));
             }
         }
         let (left, right) = self.fade_sides();
-        let fade_left_x = self.frame_to_x(rect, (kept_a as f64 + left * rate).min(kept_b as f64));
-        let fade_right_x = self.frame_to_x(rect, (kept_b as f64 - right * rate).max(kept_a as f64));
+        let fade_left_x = self.frame_to_x(rect, (kept_a as f64 + left * rate * plan.speed).min(kept_b as f64));
+        let fade_right_x = self.frame_to_x(rect, (kept_b as f64 - right * rate * plan.speed).max(kept_a as f64));
         for x in [fade_left_x, fade_right_x] {
             let c = egui::pos2(x, rect.top() + 8.0);
             painter.add(egui::Shape::convex_polygon(
@@ -748,7 +760,7 @@ impl Session {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let len = self.kept_secs();
+            let len = self.result_secs();
             ui.strong("Fades");
             ui.label("In");
             let max_in = (len - self.edits.fade_out).max(0.0);
@@ -763,9 +775,34 @@ impl Session {
             let tail = if self.has_tail() { " + effect tail" } else { "" };
             ui.weak(format!("Original {} · Result {}{tail}", fmt_time(self.duration()), fmt_time(len)));
         });
+        self.speed_controls(ui);
         self.filter_controls(ui);
         self.effect_controls(ui);
         self.volume_controls(ui);
+    }
+
+    fn speed_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Speed");
+            let e = &mut self.edits;
+            ui.add(egui::Slider::new(&mut e.speed, AudioEdits::MIN_SPEED..=AudioEdits::MAX_SPEED).logarithmic(true).suffix("×").fixed_decimals(2))
+                .on_hover_text("Slower or faster: 0.5× takes twice as long, 2× half as long");
+            for preset in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                if ui.selectable_label(e.speed == preset, format!("{preset}×")).clicked() {
+                    e.speed = preset;
+                }
+            }
+            ui.checkbox(&mut e.keep_pitch, "Keep pitch").on_hover_text(
+                "On: change speed without changing pitch (time-stretch; very large changes can sound smeared or stuttery). Off: like a tape or record played faster or slower, pitch follows speed.",
+            );
+            ui.separator();
+            ui.label("Pitch");
+            ui.add(egui::Slider::new(&mut e.pitch, -12.0..=12.0).suffix(" st").fixed_decimals(2))
+                .on_hover_text("Semitones up or down (12 is an octave; fractions are cents). Doesn't change the speed.");
+            if ui.add_enabled(e.pitch != 0.0, egui::Button::new("0")).on_hover_text("Back to the original pitch").clicked() {
+                e.pitch = 0.0;
+            }
+        });
     }
 
     fn effect_controls(&mut self, ui: &mut egui::Ui) {
@@ -968,7 +1005,7 @@ impl Session {
 
     fn done(&mut self) -> Outcome {
         self.player.stop();
-        let length = self.kept_secs();
+        let length = self.result_secs();
         if self.edits.is_noop() {
             return Outcome::Done { edits: None, thumb: None, length };
         }
@@ -982,7 +1019,7 @@ impl Session {
         let mut img = egui::ColorImage::filled(THUMB, egui::Color32::TRANSPARENT);
         let plan = self.plan();
         let (a, b) = self.kept();
-        let len = (b - a).max(1);
+        let len = plan.output_len(b - a);
         let ch = self.info.channels as usize;
         let color = egui::Color32::from_rgb(WAVE_RGB[0], WAVE_RGB[1], WAVE_RGB[2]);
         let mid = h as f32 / 2.0;
@@ -991,7 +1028,8 @@ impl Session {
             // Output frames o0..o1, in the order they'll be heard.
             let o0 = len * x as u64 / w as u64;
             let o1 = (len * (x as u64 + 1) / w as u64).max(o0 + 1);
-            let (f0, f1) = if plan.reverse { (b - o1, b - o0) } else { (a + o0, a + o1) };
+            let (s0, s1) = ((o0 as f64 * plan.speed) as u64, ((o1 as f64 * plan.speed) as u64).min(b - a));
+            let (f0, f1) = if plan.reverse { (b - s1.max(s0 + 1), b - s0) } else { (a + s0, a + s1.max(s0 + 1)) };
             let (lo, hi) = self.peaks.range(&self.samples, ch, f0 as usize, f1 as usize);
             let g = plan.gain((o0 + o1) / 2, len) * vol;
             let scale = |v: f32| if limited { (v * g).clamp(-CEILING, CEILING) } else { (v * g).clamp(-1.0, 1.0) };
@@ -1158,5 +1196,21 @@ mod tests {
         assert!(s.measurement().is_some());
         s.set_trim(1.5, 2.5);
         assert!(s.measurement().is_none());
+    }
+
+    #[test]
+    fn speed_changes_the_result_length_and_fades_stay_in_output_time() {
+        let mut s = session(5);
+        s.set_trim(1.0, 3.0);
+        s.edits.speed = 2.0;
+        assert!((s.result_secs() - 1.0).abs() < 1e-9);
+        // A fade can't be longer than the (now shorter) result.
+        s.set_fade_side(true, 5.0);
+        assert!((s.edits.fade_in - 1.0).abs() < 1e-9);
+        s.cursor = 2000;
+        assert!((s.result_position() - 0.5).abs() < 1e-9, "1 s into the kept part is 0.5 s into the result");
+        let Outcome::Done { length, thumb: Some(t), .. } = s.done() else { panic!("expected edits") };
+        assert!((length - 1.0).abs() < 1e-9);
+        assert_eq!(t.size, THUMB);
     }
 }

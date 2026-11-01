@@ -80,17 +80,17 @@ impl Player {
         let p = self.playing.as_ref()?;
         let played = p.played.load(Ordering::Relaxed);
         let pass = p.passes.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().find(|&&b| b <= played).copied();
-        let to_source = |frames: u64| (frames as f64 * p.source_rate as f64 / p.device_rate as f64) as u64;
+        let at_file_rate = |frames: u64| (frames as f64 * p.source_rate as f64 / p.device_rate as f64) as u64;
         let end = p.plan.end.unwrap_or(p.total);
-        let len = end.saturating_sub(p.plan.start).max(1);
-        // Work in output order (which runs backwards through the source when reversed);
-        // during an effect tail the playhead waits at the end.
+        let len = p.plan.output_len(end.saturating_sub(p.plan.start));
+        // Work in output frames (which run backwards through the source when reversed, and
+        // faster or slower with the speed); during an effect tail the playhead waits at the end.
         let at = match pass {
-            Some(b) => to_source(played - b),
-            None => p.plan.output_index(p.from, end) + to_source(played),
+            Some(b) => at_file_rate(played - b),
+            None => p.plan.output_index(p.from, end) + at_file_rate(played),
         }
         .min(len - 1);
-        Some(if p.plan.reverse { end - 1 - at } else { p.plan.start + at })
+        Some(p.plan.source_frame(at, end))
     }
 
     pub fn play(&mut self, req: Request) -> Result<(), String> {
@@ -264,5 +264,22 @@ mod tests {
         thread::sleep(Duration::from_millis(700));
         assert!(p.is_playing(), "still ringing well after the 250 ms clip");
         assert_eq!(p.position(), Some(frames as u64 - 1));
+    }
+
+    #[test]
+    #[ignore]
+    fn double_speed_plays_in_half_the_time() {
+        let rate = 44_100u32;
+        let frames = rate as usize; // 1 s
+        let samples: Arc<[f32]> = (0..frames).map(|i| (i as f32 * 0.06).sin() * 0.05).collect();
+        let info = StreamInfo { sample_rate: rate, channels: 1, source_bits: Some(16), total_frames: Some(frames as u64), source_rate: rate };
+        let edits = AudioEdits { speed: 2.0, ..Default::default() };
+        let mut p = Player::default();
+        p.play(Request { samples, info, edits, measured: None, from: 0, looping: false }).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        let pos = p.position().unwrap();
+        assert!(pos > rate as u64 * 3 / 10, "source position moves at twice real time: {pos}");
+        thread::sleep(Duration::from_millis(500));
+        assert!(!p.is_playing(), "1 s at 2× is done after 0.75 s");
     }
 }

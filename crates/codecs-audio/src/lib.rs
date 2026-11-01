@@ -246,14 +246,14 @@ impl Converter for AudioConverter {
                 Some(a) if measuring => {
                     let mut again = self.open(src, from)?;
                     let metered = Metered::new(&mut again, ctx, pass1).until(until);
-                    Some(edit::measure(edit::shape(Box::new(metered), a), None)?)
+                    Some(edit::measure(edit::shape(Box::new(metered), a)?, None)?)
                 }
                 _ => None,
             };
             let metered = Metered::new(&mut decoded, ctx, pass2).offset(pass1).until(until);
             let mut chain: Box<dyn AudioSource + '_> = Box::new(metered);
             if let Some(a) = audio_edits {
-                chain = edit::apply(chain, a, measured.as_ref());
+                chain = edit::apply(chain, a, measured.as_ref())?;
             }
             let wanted = match ctx.options.choice(to, &CHANNELS) {
                 "mono" => 1,
