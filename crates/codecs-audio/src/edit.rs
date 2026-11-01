@@ -1,17 +1,30 @@
 //! Audio edits as pipeline stages. The converter and the editor's preview build the same
 //! stages, so what plays in the editor is what gets written.
+//!
+//! Order: trim → reverse → filters → volume (with a limiter) → fades. Normalizing needs the
+//! level of the audio as it reaches the volume stage, so callers measure first
+//! ([`shape`] + [`measure`]) and pass the [`Measurement`] in.
 
 use crate::stages::{Remix, Resample};
 use crate::{AudioConverter, AudioSource, StreamInfo, Tags};
-use dotty_core::{AudioEdits, Error, Format, Result};
+use dotty_core::{AudioEdits, Error, Format, Result, Volume};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Seconds of fade put on a cut point so it doesn't click.
 pub const CUT_FADE: f64 = 0.005;
-/// Frames handed out per chunk by [`MemorySource`].
+/// Frames handed out per chunk by the in-memory sources.
 const CHUNK: usize = 4096;
+/// The limiter keeps peaks at or below this (−0.1 dBFS).
+pub const CEILING: f32 = 0.988_553;
+/// How far ahead the limiter looks, and how fast it lets go, in seconds.
+const LOOKAHEAD: f64 = 0.005;
+const RELEASE: f64 = 0.1;
+/// Most a volume change may boost or cut, in dB (normalizing near-silence stays sane).
+const MAX_BOOST: f32 = 40.0;
+const MAX_CUT: f32 = -60.0;
 
 /// [`AudioEdits`] resolved to frames for a stream at one rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +33,7 @@ pub struct Plan {
     pub start: u64,
     /// One past the last source frame kept, if known.
     pub end: Option<u64>,
+    pub reverse: bool,
     /// Fade lengths in output frames, including the short ones on cut points.
     pub fade_in: u64,
     pub fade_out: u64,
@@ -31,15 +45,19 @@ impl Plan {
         let (start, end) = edits.trim_frames(rate, total);
         let frames = |s: f64| (s.max(0.0) * rate as f64).round() as u64;
         let cut_fade = frames(CUT_FADE);
+        let cut_start = start > 0;
+        let cut_end = end.is_some_and(|e| total.is_none_or(|t| e < t));
+        // Reversed, the source's end is heard first.
+        let (cut_first, cut_last) = if edits.reverse { (cut_end, cut_start) } else { (cut_start, cut_end) };
         let mut fade_in = frames(edits.fade_in);
-        if start > 0 {
+        if cut_first {
             fade_in = fade_in.max(cut_fade);
         }
         let mut fade_out = frames(edits.fade_out);
-        if end.is_some_and(|e| total.is_none_or(|t| e < t)) {
+        if cut_last {
             fade_out = fade_out.max(cut_fade);
         }
-        Self { start, end, fade_in, fade_out }
+        Self { start, end, reverse: edits.reverse, fade_in, fade_out }
     }
 
     /// Gain at output frame `i` of an output `len` frames long.
@@ -54,6 +72,11 @@ impl Plan {
         }
         g
     }
+
+    /// Where kept source frame `frame` lands in the output, when the kept part ends at `end`.
+    pub fn output_index(&self, frame: u64, end: u64) -> u64 {
+        if self.reverse { end.saturating_sub(frame + 1) } else { frame.saturating_sub(self.start) }
+    }
 }
 
 /// Fade shape for `t` in 0..1: a raised cosine, so a fade starts and ends gently.
@@ -61,12 +84,97 @@ fn curve(t: f64) -> f32 {
     (0.5 - 0.5 * (std::f64::consts::PI * t.clamp(0.0, 1.0)).cos()) as f32
 }
 
-/// Applies `edits` to a stream starting at its first frame (the converter's case).
-pub fn apply<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn AudioSource + 'a> {
+/// How loud audio is, measured where the volume stage will see it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Measurement {
+    /// Highest absolute sample value.
+    pub peak: f32,
+    /// Integrated loudness in LUFS; −∞ for silence.
+    pub loudness: f64,
+}
+
+/// The linear gain `volume` asks for, given the measured audio (needed for normalizing).
+pub fn volume_gain(volume: Volume, measured: Option<&Measurement>) -> f32 {
+    let db = match volume {
+        Volume::Gain(db) => db,
+        Volume::Peak(target) => measured.filter(|m| m.peak > 0.0).map_or(0.0, |m| target - 20.0 * m.peak.log10()),
+        Volume::Loudness(target) => measured.filter(|m| m.loudness.is_finite()).map_or(0.0, |m| target - m.loudness as f32),
+    };
+    10f32.powf(db.clamp(MAX_CUT, MAX_BOOST) / 20.0)
+}
+
+/// Whether `gain` pushes peaks past [`CEILING`], so the limiter has to step in. Without a
+/// measurement any boost might.
+pub fn limits(gain: f32, measured: Option<&Measurement>) -> bool {
+    measured.map_or(gain > 1.0, |m| m.peak * gain > CEILING)
+}
+
+/// The stages before the volume: trim, reverse, filters. Measure this to normalize.
+pub fn shape<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn AudioSource + 'a> {
     let info = src.info();
     let plan = Plan::new(edits, info.sample_rate, info.total_frames);
-    let src = if plan.start > 0 || plan.end.is_some() { Box::new(Trim::new(src, plan.start, plan.end)) } else { src };
-    if plan.fade_in > 0 || plan.fade_out > 0 { Box::new(Fade::new(src, &plan, 0)) } else { src }
+    let mut src = src;
+    if plan.start > 0 || plan.end.is_some() {
+        src = Box::new(Trim::new(src, plan.start, plan.end));
+    }
+    if edits.reverse {
+        src = Box::new(Reverse::new(src));
+    }
+    with_filters(src, edits)
+}
+
+fn with_filters<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn AudioSource + 'a> {
+    let biquads = filters(edits, src.info().sample_rate);
+    if biquads.is_empty() { src } else { Box::new(Filters::new(src, biquads)) }
+}
+
+/// The stages from the volume on, for output starting `offset` frames in.
+fn finish<'a>(
+    src: Box<dyn AudioSource + 'a>,
+    edits: &AudioEdits,
+    plan: &Plan,
+    measured: Option<&Measurement>,
+    offset: u64,
+) -> Box<dyn AudioSource + 'a> {
+    let gain = volume_gain(edits.volume, measured);
+    let limit = limits(gain, measured);
+    let mut src = src;
+    if gain != 1.0 || limit {
+        src = Box::new(Gain::new(src, gain, limit));
+    }
+    if plan.fade_in > 0 || plan.fade_out > 0 {
+        src = Box::new(Fade::new(src, plan, offset));
+    }
+    src
+}
+
+/// Applies `edits` to a stream starting at its first frame (the converter's case).
+/// `measured` is [`measure`] of [`shape`] of the same stream, needed when normalizing.
+pub fn apply<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured: Option<&Measurement>) -> Box<dyn AudioSource + 'a> {
+    let info = src.info();
+    let plan = Plan::new(edits, info.sample_rate, info.total_frames);
+    finish(shape(src, edits), edits, &plan, measured, 0)
+}
+
+/// Reads `src` to the end and measures it. Stops early if `cancel` is set.
+pub fn measure(mut src: Box<dyn AudioSource + '_>, cancel: Option<&AtomicBool>) -> Result<Measurement> {
+    let info = src.info().clone();
+    let mode = ebur128::Mode::I | ebur128::Mode::HISTOGRAM;
+    let mut meter = ebur128::EbuR128::new(info.channels as u32, info.sample_rate, mode).ok();
+    let mut peak = 0.0f32;
+    while let Some(chunk) = src.next_chunk()? {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Error::Cancelled);
+        }
+        peak = chunk.iter().fold(peak, |p, s| p.max(s.abs()));
+        if let Some(m) = &mut meter
+            && m.add_frames_f32(chunk).is_err()
+        {
+            meter = None;
+        }
+    }
+    let loudness = meter.and_then(|m| m.loudness_global().ok()).filter(|l| l.is_finite()).unwrap_or(f64::NEG_INFINITY);
+    Ok(Measurement { peak, loudness })
 }
 
 /// Keeps source frames `start..end` and drops the rest.
@@ -234,12 +342,306 @@ impl AudioSource for MemorySource {
     }
 }
 
-/// The editor's preview: `samples` with `edits` applied, starting at source frame `from`
-/// (clamped into the kept range), adapted to a device's channel count (1 or 2) and rate.
+/// Plays the stream backwards. It has to read all of it first; the editor only takes files
+/// it can hold in memory, so edited streams are bounded.
+pub struct Reverse<'a> {
+    inner: Box<dyn AudioSource + 'a>,
+    read: Option<ReversedMemory>,
+}
+
+impl<'a> Reverse<'a> {
+    pub fn new(inner: Box<dyn AudioSource + 'a>) -> Self {
+        Self { inner, read: None }
+    }
+}
+
+impl AudioSource for Reverse<'_> {
+    fn info(&self) -> &StreamInfo {
+        self.inner.info()
+    }
+    fn tags(&self) -> &Tags {
+        self.inner.tags()
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        if self.read.is_none() {
+            let mut all = Vec::new();
+            while let Some(chunk) = self.inner.next_chunk()? {
+                all.extend_from_slice(chunk);
+            }
+            let frames = (all.len() / self.inner.info().channels.max(1) as usize) as u64;
+            self.read = Some(ReversedMemory::new(all.into(), self.inner.info(), 0, frames));
+        }
+        self.read.as_mut().map_or(Ok(None), |r| r.next_chunk())
+    }
+    fn end_note(&self) -> Option<String> {
+        self.inner.end_note()
+    }
+}
+
+/// Interleaved samples held in memory, read backwards from frame `hi - 1` down to `lo`.
+pub struct ReversedMemory {
+    samples: Arc<[f32]>,
+    info: StreamInfo,
+    tags: Tags,
+    lo: usize,
+    hi: usize,
+    out: Vec<f32>,
+}
+
+impl ReversedMemory {
+    pub fn new(samples: Arc<[f32]>, info: &StreamInfo, lo: u64, hi: u64) -> Self {
+        let ch = info.channels.max(1) as usize;
+        let hi = (hi as usize).min(samples.len() / ch);
+        let lo = (lo as usize).min(hi);
+        let mut info = info.clone();
+        info.total_frames = Some((hi - lo) as u64);
+        Self { samples, info, tags: Tags::default(), lo, hi, out: Vec::new() }
+    }
+}
+
+impl AudioSource for ReversedMemory {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+    fn tags(&self) -> &Tags {
+        &self.tags
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        if self.hi <= self.lo {
+            return Ok(None);
+        }
+        let ch = self.info.channels as usize;
+        let from = self.hi.saturating_sub(CHUNK).max(self.lo);
+        self.out.clear();
+        for f in self.samples[from * ch..self.hi * ch].chunks_exact(ch).rev() {
+            self.out.extend_from_slice(f);
+        }
+        self.hi = from;
+        Ok(Some(&self.out))
+    }
+}
+
+/// One second-order filter section (RBJ cookbook, Butterworth Q: 12 dB/octave).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+}
+
+impl Biquad {
+    fn new(freq: f32, rate: u32, high_pass: bool) -> Self {
+        let w0 = 2.0 * std::f64::consts::PI * freq as f64 / rate as f64;
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+        let a0 = 1.0 + alpha;
+        let (b0, b1) = if high_pass { ((1.0 + cos) / 2.0, -(1.0 + cos)) } else { ((1.0 - cos) / 2.0, 1.0 - cos) };
+        Self { b0: b0 / a0, b1: b1 / a0, b2: b0 / a0, a1: -2.0 * cos / a0, a2: (1.0 - alpha) / a0 }
+    }
+}
+
+/// The filter sections `edits` ask for at `rate`; cutoffs the rate can't carry are skipped.
+fn filters(edits: &AudioEdits, rate: u32) -> Vec<Biquad> {
+    let nyquist = rate as f32 / 2.0;
+    let mut out = Vec::new();
+    if let Some(f) = edits.low_cut.filter(|&f| f > 0.0 && f < nyquist * 0.9) {
+        out.push(Biquad::new(f, rate, true));
+    }
+    if let Some(f) = edits.high_cut.filter(|&f| f > 0.0 && f < nyquist * 0.95) {
+        out.push(Biquad::new(f, rate, false));
+    }
+    out
+}
+
+/// Runs every channel through the same chain of [`Biquad`]s.
+struct Filters<S> {
+    inner: S,
+    biquads: Vec<Biquad>,
+    /// Two state values per biquad per channel.
+    state: Vec<[f64; 2]>,
+    buf: Vec<f32>,
+}
+
+impl<S: AudioSource> Filters<S> {
+    fn new(inner: S, biquads: Vec<Biquad>) -> Self {
+        let state = vec![[0.0; 2]; biquads.len() * inner.info().channels as usize];
+        Self { inner, biquads, state, buf: Vec::new() }
+    }
+}
+
+impl<S: AudioSource> AudioSource for Filters<S> {
+    fn info(&self) -> &StreamInfo {
+        self.inner.info()
+    }
+    fn tags(&self) -> &Tags {
+        self.inner.tags()
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        let ch = self.inner.info().channels as usize;
+        let Some(chunk) = self.inner.next_chunk()? else { return Ok(None) };
+        self.buf.clear();
+        self.buf.extend_from_slice(chunk);
+        for frame in self.buf.chunks_exact_mut(ch) {
+            for (c, s) in frame.iter_mut().enumerate() {
+                let mut x = *s as f64;
+                for (k, q) in self.biquads.iter().enumerate() {
+                    // Transposed direct form II.
+                    let z = &mut self.state[k * ch + c];
+                    let y = q.b0 * x + z[0];
+                    z[0] = q.b1 * x - q.a1 * y + z[1];
+                    z[1] = q.b2 * x - q.a2 * y;
+                    x = y;
+                }
+                *s = x as f32;
+            }
+        }
+        Ok(Some(&self.buf))
+    }
+    fn end_note(&self) -> Option<String> {
+        self.inner.end_note()
+    }
+}
+
+/// Multiplies by a gain, with an optional lookahead limiter that keeps peaks under
+/// [`CEILING`]: the gain needed for each frame is held over the lookahead window and
+/// averaged over it, so reduction ramps in smoothly and is complete by the time the peak
+/// arrives; it then recovers with a [`RELEASE`] time constant.
+struct Gain<S> {
+    inner: S,
+    gain: f32,
+    limiter: Option<Limiter>,
+    out: Vec<f32>,
+    done: bool,
+}
+
+impl<S: AudioSource> Gain<S> {
+    fn new(inner: S, gain: f32, limit: bool) -> Self {
+        let info = inner.info();
+        let limiter = limit.then(|| Limiter::new(info.channels as usize, info.sample_rate));
+        Self { inner, gain, limiter, out: Vec::new(), done: false }
+    }
+}
+
+impl<S: AudioSource> AudioSource for Gain<S> {
+    fn info(&self) -> &StreamInfo {
+        self.inner.info()
+    }
+    fn tags(&self) -> &Tags {
+        self.inner.tags()
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        let ch = self.inner.info().channels as usize;
+        while !self.done {
+            self.out.clear();
+            match self.inner.next_chunk()? {
+                Some(chunk) => match &mut self.limiter {
+                    None => self.out.extend(chunk.iter().map(|s| s * self.gain)),
+                    Some(l) => {
+                        let mut frame = vec![0.0; ch];
+                        for f in chunk.chunks_exact(ch) {
+                            frame.iter_mut().zip(f).for_each(|(o, s)| *o = s * self.gain);
+                            l.push(Some(&frame), &mut self.out);
+                        }
+                    }
+                },
+                None => {
+                    self.done = true;
+                    if let Some(l) = &mut self.limiter {
+                        l.flush(&mut self.out);
+                    }
+                }
+            }
+            if !self.out.is_empty() {
+                return Ok(Some(&self.out));
+            }
+        }
+        Ok(None)
+    }
+    fn end_note(&self) -> Option<String> {
+        self.inner.end_note()
+    }
+}
+
+struct Limiter {
+    channels: usize,
+    look: usize,
+    release: f32,
+    /// Frames waiting for the lookahead to fill, interleaved.
+    delay: VecDeque<f32>,
+    /// `(frame, gain needed)`, increasing gains: the window's minimum is at the front.
+    needed: VecDeque<(u64, f32)>,
+    /// The last `look` held gains and their sum, for the moving average.
+    held: VecDeque<f32>,
+    held_sum: f64,
+    frames: u64,
+    env: f32,
+}
+
+impl Limiter {
+    fn new(channels: usize, rate: u32) -> Self {
+        let look = ((LOOKAHEAD * rate as f64) as usize).max(1);
+        let release = 1.0 - (-1.0 / (RELEASE * rate as f64)).exp() as f32;
+        Self {
+            channels,
+            look,
+            release,
+            delay: VecDeque::new(),
+            needed: VecDeque::new(),
+            held: std::iter::repeat_n(1.0, look).collect(),
+            held_sum: look as f64,
+            frames: 0,
+            env: 1.0,
+        }
+    }
+
+    /// Take in one frame (`None` past the end) and give out the frame `look` behind it.
+    fn push(&mut self, frame: Option<&[f32]>, out: &mut Vec<f32>) {
+        let n = self.frames;
+        self.frames += 1;
+        let need = frame.map_or(1.0, |f| {
+            let peak = f.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+            if peak > CEILING { CEILING / peak } else { 1.0 }
+        });
+        while self.needed.back().is_some_and(|b| b.1 >= need) {
+            self.needed.pop_back();
+        }
+        self.needed.push_back((n, need));
+        if let Some(f) = frame {
+            self.delay.extend(f);
+        }
+        let Some(k) = (n + 1).checked_sub(self.look as u64) else { return };
+        while self.needed.front().is_some_and(|f| f.0 < k) {
+            self.needed.pop_front();
+        }
+        let hold = self.needed.front().map_or(1.0, |f| f.1);
+        self.held.push_back(hold);
+        self.held_sum += hold as f64 - self.held.pop_front().unwrap_or(1.0) as f64;
+        let target = (self.held_sum / self.look as f64) as f32;
+        self.env = if target < self.env { target } else { self.env + (target - self.env) * self.release };
+        if self.delay.len() >= self.channels {
+            for s in self.delay.drain(..self.channels) {
+                out.push((s * self.env).clamp(-CEILING, CEILING));
+            }
+        }
+    }
+
+    fn flush(&mut self, out: &mut Vec<f32>) {
+        while !self.delay.is_empty() {
+            self.push(None, out);
+        }
+    }
+}
+
+/// The editor's preview: `samples` with `edits` applied, heard from source frame `from`
+/// (clamped into the kept range; when reversed it plays from there towards the start),
+/// adapted to a device's channel count (1 or 2) and rate.
 pub fn preview<'a>(
     samples: Arc<[f32]>,
     info: &StreamInfo,
     edits: &AudioEdits,
+    measured: Option<&Measurement>,
     from: u64,
     channels: u16,
     rate: u32,
@@ -248,10 +650,12 @@ pub fn preview<'a>(
     let plan = Plan::new(edits, info.sample_rate, Some(total));
     let end = plan.end.unwrap_or(total);
     let from = from.clamp(plan.start, end.saturating_sub(1));
-    let mut chain: Box<dyn AudioSource> = Box::new(MemorySource::new(samples, info, from, Some(end)));
-    if plan.fade_in > 0 || plan.fade_out > 0 {
-        chain = Box::new(Fade::new(chain, &plan, from - plan.start));
-    }
+    let src: Box<dyn AudioSource> = if plan.reverse {
+        Box::new(ReversedMemory::new(samples, info, plan.start, from + 1))
+    } else {
+        Box::new(MemorySource::new(samples, info, from, Some(end)))
+    };
+    let mut chain = finish(with_filters(src, edits), edits, &plan, measured, plan.output_index(from, end));
     if channels != info.channels {
         chain = Box::new(Remix::new(chain, channels.clamp(1, 2)));
     }
@@ -259,6 +663,11 @@ pub fn preview<'a>(
         chain = Box::new(Resample::new(chain, rate)?);
     }
     Ok(chain)
+}
+
+/// Measures the editor's in-memory copy as the volume stage will see it.
+pub fn measure_memory(samples: Arc<[f32]>, info: &StreamInfo, edits: &AudioEdits, cancel: &AtomicBool) -> Result<Measurement> {
+    measure(shape(Box::new(MemorySource::new(samples, info, 0, None)), edits), Some(cancel))
 }
 
 /// Decode a whole file into memory for the editor. Fails if it's longer than `max_secs`.
@@ -320,7 +729,7 @@ mod tests {
         let samples: Arc<[f32]> = vec![1.0; 9000].into();
         let mut i = info(1, 9000);
         i.total_frames = None;
-        let plan = Plan { start: 0, end: None, fade_in: 1000, fade_out: 2000 };
+        let plan = Plan { start: 0, end: None, reverse: false, fade_in: 1000, fade_out: 2000 };
         let out = drain(Fade::new(MemorySource::new(samples, &i, 0, None), &plan, 0));
         assert_eq!(out.len(), 9000);
         assert!(out[0] < 1e-3 && out[8999] < 1e-3);
@@ -344,9 +753,99 @@ mod tests {
         let samples: Arc<[f32]> = vec![0.5; 4000].into();
         let i = info(1, 4000);
         let e = AudioEdits { trim_start: 0.5, fade_in: 1.0, ..Default::default() };
-        let full = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e));
-        let part = drain(preview(samples, &i, &e, 1000, 1, 1000).unwrap());
+        let full = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None));
+        let part = drain(preview(samples, &i, &e, None, 1000, 1, 1000).unwrap());
         assert_eq!(full.len(), 3500);
         assert_eq!(&full[500..], &part[..]);
+    }
+
+    fn sine(freq: f32, amp: f32, rate: u32, secs: f32) -> Vec<f32> {
+        (0..(rate as f32 * secs) as usize).map(|i| (i as f32 * freq * std::f32::consts::TAU / rate as f32).sin() * amp).collect()
+    }
+
+    fn info_at(rate: u32, channels: u16, frames: usize) -> StreamInfo {
+        StreamInfo { sample_rate: rate, channels, source_bits: None, total_frames: Some(frames as u64), source_rate: rate }
+    }
+
+    fn render(samples: Vec<f32>, rate: u32, edits: &AudioEdits) -> Vec<f32> {
+        let i = info_at(rate, 1, samples.len());
+        let samples: Arc<[f32]> = samples.into();
+        let cancel = AtomicBool::new(false);
+        let m = edits.volume.measures().then(|| measure_memory(samples.clone(), &i, edits, &cancel).unwrap());
+        drain(apply(Box::new(MemorySource::new(samples, &i, 0, None)), edits, m.as_ref()))
+    }
+
+    fn rms(v: &[f32]) -> f32 {
+        // Skip the filters' settling time.
+        let v = &v[v.len() / 4..];
+        (v.iter().map(|s| s * s).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn low_and_high_cut_remove_their_side_and_keep_the_other() {
+        let rate = 48_000;
+        let low = AudioEdits { low_cut: Some(200.0), ..Default::default() };
+        assert!(rms(&render(sine(40.0, 0.5, rate, 1.0), rate, &low)) < 0.5 / 2f32.sqrt() * 0.05);
+        assert!((rms(&render(sine(2000.0, 0.5, rate, 1.0), rate, &low)) / (0.5 / 2f32.sqrt()) - 1.0).abs() < 0.02);
+        let high = AudioEdits { high_cut: Some(2000.0), ..Default::default() };
+        assert!(rms(&render(sine(16_000.0, 0.5, rate, 1.0), rate, &high)) < 0.5 / 2f32.sqrt() * 0.05);
+        assert!((rms(&render(sine(200.0, 0.5, rate, 1.0), rate, &high)) / (0.5 / 2f32.sqrt()) - 1.0).abs() < 0.02);
+        // Cutoffs the rate can't carry are skipped rather than blowing up.
+        let silly = AudioEdits { high_cut: Some(30_000.0), ..Default::default() };
+        assert!(filters(&silly, rate).is_empty());
+    }
+
+    #[test]
+    fn limiter_holds_the_ceiling_and_leaves_quiet_parts_alone() {
+        let rate = 48_000;
+        let mut v = sine(300.0, 0.05, rate, 1.0);
+        for s in &mut v[24_000..24_480] {
+            *s *= 18.0; // a 0.9 burst
+        }
+        let n = v.len();
+        let out = render(v.clone(), rate, &AudioEdits { volume: Volume::Gain(12.0), ..Default::default() });
+        assert_eq!(out.len(), n, "lookahead doesn't change the length");
+        assert!(out.iter().all(|s| s.abs() <= CEILING), "peak {}", out.iter().fold(0.0f32, |p, s| p.max(s.abs())));
+        let g = 10f32.powf(12.0 / 20.0);
+        // Before the burst (lookahead is only 5 ms) the gain is exact; the release recovers
+        // exponentially (100 ms), so ~0.5 s after it the gain is back within 1%.
+        for i in [1000, 20_000] {
+            assert!((out[i] - v[i] * g).abs() < 1e-4, "frame {i}: {} vs {}", out[i], v[i] * g);
+        }
+        assert!((out[47_000] / (v[47_000] * g) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn normalizes_to_a_peak_and_to_a_loudness() {
+        let rate = 48_000;
+        let peaked = render(sine(1000.0, 0.25, rate, 2.0), rate, &AudioEdits { volume: Volume::Peak(-1.0), ..Default::default() });
+        let peak = peaked.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+        assert!((20.0 * peak.log10() + 1.0).abs() < 0.01, "{peak}");
+
+        let target = -23.0;
+        let loud = render(sine(1000.0, 0.05, rate, 4.0), rate, &AudioEdits { volume: Volume::Loudness(target), ..Default::default() });
+        let i = info_at(rate, 1, loud.len());
+        let m = measure(Box::new(MemorySource::new(loud.into(), &i, 0, None)), None).unwrap();
+        assert!((m.loudness - target as f64).abs() < 0.1, "{m:?}");
+        // Silence can't be normalized: left alone.
+        assert_eq!(volume_gain(Volume::Loudness(-14.0), Some(&Measurement { peak: 0.0, loudness: f64::NEG_INFINITY })), 1.0);
+    }
+
+    #[test]
+    fn reverse_plays_the_kept_part_backwards_and_previews_from_the_playhead() {
+        let samples = ramp(2, 10_000);
+        let i = info(2, 10_000);
+        let e = AudioEdits { trim_start: 1.0, trim_end: Some(9.0), reverse: true, fade_out: 0.5, ..Default::default() };
+        let full = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None));
+        assert_eq!(full.len(), 8000 * 2);
+        // The cut at 9 s is heard first, so it gets the short cut fade; the 0.5 s fade-out ends at 1 s.
+        let plan = Plan::new(&e, 1000, Some(10_000));
+        assert_eq!((plan.fade_in, plan.fade_out), (5, 500));
+        assert_eq!(full[2 * 100], 8899.0, "frame 100 of the output is source frame 8899");
+        assert!(full[full.len() - 1] < 1.0);
+        let part = drain(preview(samples, &i, &e, None, 5000, 2, 1000).unwrap());
+        assert_eq!(part.len(), 4001 * 2);
+        assert_eq!(&full[full.len() - part.len()..], &part[..]);
+        assert_eq!(plan.output_index(5000, 9000), 3999);
     }
 }

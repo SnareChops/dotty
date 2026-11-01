@@ -78,13 +78,20 @@ pub enum EditOp {
 }
 
 /// Changes to an audio file. Unlike image edits these are a fixed set of knobs: the
-/// pipeline turns them into stages in a set order (trim, then fades).
+/// pipeline turns them into stages in a set order (trim, reverse, filters, volume, fades).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioEdits {
     /// Keep from here (seconds into the source).
     pub trim_start: f64,
     /// Keep up to here (seconds into the source); `None` = to the end.
     pub trim_end: Option<f64>,
+    /// Play the kept part backwards.
+    pub reverse: bool,
+    /// Remove what's below this many Hz (rumble, hum), 12 dB/octave.
+    pub low_cut: Option<f32>,
+    /// Remove what's above this many Hz (hiss), 12 dB/octave.
+    pub high_cut: Option<f32>,
+    pub volume: Volume,
     /// Fade-in and fade-out lengths in seconds of output.
     pub fade_in: f64,
     pub fade_out: f64,
@@ -92,7 +99,34 @@ pub struct AudioEdits {
 
 impl Default for AudioEdits {
     fn default() -> Self {
-        Self { trim_start: 0.0, trim_end: None, fade_in: 0.0, fade_out: 0.0 }
+        Self {
+            trim_start: 0.0,
+            trim_end: None,
+            reverse: false,
+            low_cut: None,
+            high_cut: None,
+            volume: Volume::Gain(0.0),
+            fade_in: 0.0,
+            fade_out: 0.0,
+        }
+    }
+}
+
+/// How loud the result is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Volume {
+    /// Change by this many dB.
+    Gain(f32),
+    /// Scale so the highest peak sits at this many dBFS.
+    Peak(f32),
+    /// Scale to this integrated loudness (LUFS, EBU R128).
+    Loudness(f32),
+}
+
+impl Volume {
+    /// Whether the audio has to be measured first.
+    pub fn measures(self) -> bool {
+        !matches!(self, Volume::Gain(_))
     }
 }
 

@@ -1,11 +1,11 @@
 //! The audio editor: a modal over the file list for quick changes before a conversion
-//! (trim, fades). It decodes the file into memory, plays a preview through the same stages
+//! (trim, reverse, filters, volume, fades). It decodes the file into memory, plays a preview through the same stages
 //! the converter uses, and produces [`Edits`] for the job, so the source is never changed.
 
 use crate::player::{Player, Request};
 use codecs_audio::StreamInfo;
-use codecs_audio::edit::{Plan, decode_all};
-use dotty_core::{AudioEdits, EditOp, Edits, Format, JobId};
+use codecs_audio::edit::{CEILING, Measurement, Plan, decode_all, limits, measure_memory, volume_gain};
+use dotty_core::{AudioEdits, EditOp, Edits, Format, JobId, Volume};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,8 +156,10 @@ fn merge(it: impl Iterator<Item = (f32, f32)>) -> (f32, f32) {
 enum Drag {
     Start,
     End,
-    FadeIn,
-    FadeOut,
+    /// The fade grip on the left or right of the kept part (fade-in and fade-out swap
+    /// sides when reversed).
+    FadeLeft,
+    FadeRight,
     /// Drawing a new kept range from this frame.
     New(u64),
     Pan,
@@ -189,6 +191,23 @@ struct Session {
     start_text: String,
     end_text: String,
     silence_db: f32,
+    /// The level of the audio reaching the volume stage, for the edits it was measured with
+    /// (only the ones before that stage matter).
+    measured: Option<(AudioEdits, Measurement)>,
+    measuring: Option<Measuring>,
+}
+
+/// A measurement running in the background; dropping it cancels it.
+struct Measuring {
+    key: AudioEdits,
+    rx: mpsc::Receiver<codecs_audio::edit::Measurement>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for Measuring {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Session {
@@ -215,8 +234,10 @@ impl Session {
             start_text: String::new(),
             end_text: String::new(),
             silence_db: -50.0,
+            measured: None,
+            measuring: None,
         };
-        s.cursor = s.plan().start;
+        s.cursor = s.result_start();
         s
     }
 
@@ -259,12 +280,96 @@ impl Session {
         self.edits.fade_out = self.edits.fade_out.clamp(0.0, len - self.edits.fade_in);
     }
 
+    /// The source frame the result begins with (the kept part's end when reversed).
+    fn result_start(&self) -> u64 {
+        let (a, b) = self.kept();
+        if self.edits.reverse { b - 1 } else { a }
+    }
+
+    fn result_end(&self) -> u64 {
+        let (a, b) = self.kept();
+        if self.edits.reverse { a } else { b - 1 }
+    }
+
+    /// The fade on the left / right of the kept part, in seconds.
+    fn fade_sides(&self) -> (f64, f64) {
+        let e = &self.edits;
+        if e.reverse { (e.fade_out, e.fade_in) } else { (e.fade_in, e.fade_out) }
+    }
+
+    fn set_fade_side(&mut self, left: bool, secs: f64) {
+        let (l, r) = self.fade_sides();
+        let secs = secs.clamp(0.0, (self.kept_secs() - if left { r } else { l }).max(0.0));
+        let fade_in_side = left != self.edits.reverse;
+        if fade_in_side {
+            self.edits.fade_in = secs;
+        } else {
+            self.edits.fade_out = secs;
+        }
+    }
+
+    /// The edits that change what the volume stage measures.
+    fn shape_key(&self) -> AudioEdits {
+        let e = &self.edits;
+        AudioEdits { trim_start: e.trim_start, trim_end: e.trim_end, reverse: e.reverse, low_cut: e.low_cut, high_cut: e.high_cut, ..Default::default() }
+    }
+
+    fn measurement(&self) -> Option<&Measurement> {
+        let key = self.shape_key();
+        self.measured.as_ref().filter(|(k, _)| *k == key).map(|(_, m)| m)
+    }
+
+    /// Linear gain of the volume stage, and whether its limiter will be working.
+    fn volume(&self) -> (f32, bool) {
+        let m = self.measurement();
+        let g = volume_gain(self.edits.volume, m);
+        (g, limits(g, m))
+    }
+
+    /// Collect a finished measurement, and start one when the edits it depends on changed
+    /// (not mid-drag, so dragging a handle doesn't start dozens).
+    fn update_measurement(&mut self, ctx: &egui::Context, pointer_down: bool) {
+        if let Some(m) = &self.measuring {
+            match m.rx.try_recv() {
+                Ok(v) => {
+                    self.measured = Some((m.key, v));
+                    self.measuring = None;
+                    // Normalizing depends on it, so what's playing changes.
+                    self.replay |= self.edits.volume.measures() && self.player.is_playing();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.measuring = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let key = self.shape_key();
+        if pointer_down || self.measurement().is_some() || self.measuring.as_ref().is_some_and(|m| m.key == key) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (samples, info, stop, ctx) = (self.samples.clone(), self.info.clone(), cancel.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            if let Ok(m) = measure_memory(samples, &info, &key, &stop) {
+                let _ = tx.send(m);
+                ctx.request_repaint();
+            }
+        });
+        self.measuring = Some(Measuring { key, rx, cancel });
+    }
+
     fn position(&self) -> u64 {
         self.player.position().unwrap_or(self.cursor)
     }
 
     fn play_from(&mut self, from: u64) {
-        let req = Request { samples: self.samples.clone(), info: self.info.clone(), edits: self.edits, from, looping: self.looping };
+        let req = Request {
+            samples: self.samples.clone(),
+            info: self.info.clone(),
+            edits: self.edits,
+            measured: self.measurement().copied(),
+            from,
+            looping: self.looping,
+        };
         self.error = self.player.play(req).err();
     }
 
@@ -273,7 +378,9 @@ impl Session {
             self.player.stop();
         } else {
             let (a, b) = self.kept();
-            let from = if (a..b.saturating_sub(1)).contains(&self.cursor) { self.cursor } else { a };
+            // From the playhead if there's something left to hear after it, else from the top.
+            let rest = if self.edits.reverse { a + 1..b } else { a..b - 1 };
+            let from = if rest.contains(&self.cursor) { self.cursor } else { self.result_start() };
             self.cursor = from;
             self.play_from(from);
         }
@@ -289,9 +396,9 @@ impl Session {
     fn ui(&mut self, ui: &mut egui::Ui, title: &str) -> Outcome {
         let mut outcome = Outcome::Open;
         let before = self.edits;
-        if self.player.reap() {
-            // Reached the end: back to where it started, like most players.
-        }
+        // Reaching the end leaves the playhead where playback started, like most players.
+        self.player.reap();
+        self.update_measurement(ui.ctx(), ui.input(|i| i.pointer.any_down()));
         if self.player.is_playing() {
             ui.ctx().request_repaint();
         }
@@ -304,7 +411,7 @@ impl Session {
                 self.toggle_play();
             }
             if ui.button("⏮").on_hover_text("Back to the start (Home)").clicked() {
-                self.seek(self.kept().0);
+                self.seek(self.result_start());
             }
             if ui.toggle_value(&mut self.looping, "🔁 Loop").on_hover_text("Play the kept part over and over (L)").changed() && playing {
                 self.play_from(self.position());
@@ -326,7 +433,7 @@ impl Session {
         });
         ui.add_space(4.0);
 
-        let controls = 96.0;
+        let controls = 150.0;
         let wave_size = ui.available_size() - egui::vec2(0.0, controls);
         let (rect, resp) = ui.allocate_exact_size(wave_size.max(egui::vec2(64.0, 80.0)), egui::Sense::click_and_drag());
         self.waveform(ui, rect, &resp);
@@ -385,9 +492,7 @@ impl Session {
         let ruler = egui::Rect::from_min_max(full.min, egui::pos2(full.right(), full.top() + RULER));
         let rect = egui::Rect::from_min_max(egui::pos2(full.left(), ruler.bottom()), full.max);
         let rate = self.rate();
-        let plan = self.plan();
         let (kept_a, kept_b) = self.kept();
-        let kept_len = kept_b - kept_a;
 
         // Zoom about the pointer, pan with horizontal scroll.
         if let Some(pos) = resp.hover_pos() {
@@ -408,15 +513,16 @@ impl Session {
         // Handles: trim edges, and fade grips along the top.
         let x_start = self.frame_to_x(rect, kept_a as f64);
         let x_end = self.frame_to_x(rect, kept_b as f64);
-        let x_fade_in = self.frame_to_x(rect, (kept_a + plan.fade_in.min(kept_len)) as f64);
-        let x_fade_out = self.frame_to_x(rect, kept_b.saturating_sub(plan.fade_out.min(kept_len)) as f64);
+        let (left, right) = self.fade_sides();
+        let x_fade_left = self.frame_to_x(rect, (kept_a as f64 + left * rate).min(kept_b as f64));
+        let x_fade_right = self.frame_to_x(rect, (kept_b as f64 - right * rate).max(kept_a as f64));
         let grip_y = rect.top() + 8.0;
         let grip = |x: f32| egui::pos2(x, grip_y);
         let hit = |pos: egui::Pos2| -> Option<Drag> {
-            if pos.distance(grip(x_fade_in)) < GRAB + 2.0 {
-                Some(Drag::FadeIn)
-            } else if pos.distance(grip(x_fade_out)) < GRAB + 2.0 {
-                Some(Drag::FadeOut)
+            if pos.distance(grip(x_fade_left)) < GRAB + 2.0 {
+                Some(Drag::FadeLeft)
+            } else if pos.distance(grip(x_fade_right)) < GRAB + 2.0 {
+                Some(Drag::FadeRight)
             } else if (pos.x - x_start).abs() < GRAB {
                 Some(Drag::Start)
             } else if (pos.x - x_end).abs() < GRAB {
@@ -427,7 +533,7 @@ impl Session {
         };
         if let Some(pos) = resp.hover_pos() {
             match self.drag.or_else(|| hit(pos)) {
-                Some(Drag::Start | Drag::End | Drag::FadeIn | Drag::FadeOut) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal),
+                Some(Drag::Start | Drag::End | Drag::FadeLeft | Drag::FadeRight) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal),
                 Some(Drag::Pan) => ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing),
                 _ => {}
             }
@@ -449,13 +555,8 @@ impl Session {
             match drag {
                 Drag::Start => self.set_trim(secs.min(b - 1.0 / rate), b),
                 Drag::End => self.set_trim(a, secs.max(a + 1.0 / rate)),
-                Drag::FadeIn => {
-                    self.edits.fade_in = (secs - a).max(0.0);
-                    self.clamp_fades();
-                }
-                Drag::FadeOut => {
-                    self.edits.fade_out = (b - secs).clamp(0.0, (b - a - self.edits.fade_in).max(0.0));
-                }
+                Drag::FadeLeft => self.set_fade_side(true, secs - a),
+                Drag::FadeRight => self.set_fade_side(false, b - secs),
                 Drag::New(anchor) => {
                     let anchor = anchor as f64 / rate;
                     self.set_trim(anchor.min(secs), anchor.max(secs));
@@ -474,7 +575,7 @@ impl Session {
                     self.edits = self.before_drag;
                     self.seek(anchor);
                 } else {
-                    self.cursor = a;
+                    self.cursor = self.result_start();
                 }
             }
             self.drag = None;
@@ -493,6 +594,15 @@ impl Session {
         let plan = self.plan();
         let (kept_a, kept_b) = self.kept();
         let kept_len = kept_b - kept_a;
+        let (vol, limited) = self.volume();
+        // What a sample sounds like after fades and volume (filters aren't drawn).
+        let level = |s: f32, f: u64| -> f32 {
+            if !(kept_a..kept_b).contains(&f) {
+                return s;
+            }
+            let v = s * plan.gain(plan.output_index(f, kept_b), kept_len) * vol;
+            if limited { v.clamp(-CEILING, CEILING) } else { v }
+        };
         let visuals = ui.visuals().clone();
         let painter = ui.painter_at(full);
         painter.rect_filled(rect, 2.0, visuals.extreme_bg_color);
@@ -525,8 +635,7 @@ impl Session {
             let points: Vec<egui::Pos2> = (a..b)
                 .map(|f| {
                     let s = self.samples[f as usize * ch..f as usize * ch + ch].iter().sum::<f32>() / ch as f32;
-                    let g = if (kept_a..kept_b).contains(&f) { plan.gain(f - kept_a, kept_len) } else { 1.0 };
-                    egui::pos2(self.frame_to_x(rect, f as f64 + 0.5), mid - s * g * half)
+                    egui::pos2(self.frame_to_x(rect, f as f64 + 0.5), mid - level(s, f) * half)
                 })
                 .collect();
             painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, accent)));
@@ -540,9 +649,8 @@ impl Session {
                 let (lo, hi) = self.peaks.range(&self.samples, ch, a as usize, b as usize);
                 let centre = (a + b) / 2;
                 let inside = (kept_a..kept_b).contains(&centre);
-                let g = if inside { plan.gain(centre - kept_a, kept_len) } else { 1.0 };
                 let x = rect.left() + px as f32 + 0.5;
-                let (top, bottom) = (mid - hi * g * half, mid - lo * g * half);
+                let (top, bottom) = (mid - level(hi, centre) * half, mid - level(lo, centre) * half);
                 painter.line_segment([egui::pos2(x, top.min(mid - 0.5)), egui::pos2(x, bottom.max(mid + 0.5))], egui::Stroke::new(1.0, if inside { accent } else { dim }));
             }
         }
@@ -565,20 +673,22 @@ impl Session {
         // Fade envelopes and their grips.
         let env_y = |g: f32| rect.top() + 8.0 + (1.0 - g) * (rect.height() - 16.0);
         let env = egui::Stroke::new(1.5, visuals.warn_fg_color);
-        for (from, to) in [(kept_a, kept_a + plan.fade_in.min(kept_len)), (kept_b.saturating_sub(plan.fade_out.min(kept_len)), kept_b)] {
+        let (left_frames, right_frames) = if plan.reverse { (plan.fade_out, plan.fade_in) } else { (plan.fade_in, plan.fade_out) };
+        for (from, to) in [(kept_a, kept_a + left_frames.min(kept_len)), (kept_b.saturating_sub(right_frames.min(kept_len)), kept_b)] {
             if to > from {
                 let points: Vec<egui::Pos2> = (0..=48)
                     .map(|k| {
-                        let f = from + (to - from) * k / 48;
-                        egui::pos2(self.frame_to_x(rect, f as f64), env_y(plan.gain((f - kept_a).min(kept_len - 1), kept_len)))
+                        let f = (from + (to - from) * k / 48).min(kept_b - 1);
+                        egui::pos2(self.frame_to_x(rect, f as f64), env_y(plan.gain(plan.output_index(f, kept_b), kept_len)))
                     })
                     .collect();
                 painter.add(egui::Shape::line(points, env));
             }
         }
-        let fade_in_x = self.frame_to_x(rect, (kept_a + (self.edits.fade_in * rate) as u64).min(kept_b) as f64);
-        let fade_out_x = self.frame_to_x(rect, kept_b.saturating_sub((self.edits.fade_out * rate) as u64).max(kept_a) as f64);
-        for x in [fade_in_x, fade_out_x] {
+        let (left, right) = self.fade_sides();
+        let fade_left_x = self.frame_to_x(rect, (kept_a as f64 + left * rate).min(kept_b as f64));
+        let fade_right_x = self.frame_to_x(rect, (kept_b as f64 - right * rate).max(kept_a as f64));
+        for x in [fade_left_x, fade_right_x] {
             let c = egui::pos2(x, rect.top() + 8.0);
             painter.add(egui::Shape::convex_polygon(
                 vec![c + egui::vec2(0.0, -5.0), c + egui::vec2(5.0, 0.0), c + egui::vec2(0.0, 5.0), c + egui::vec2(-5.0, 0.0)],
@@ -641,6 +751,88 @@ impl Session {
             ui.separator();
             ui.weak(format!("Original {} · Result {}", fmt_time(self.duration()), fmt_time(len)));
         });
+        self.volume_controls(ui);
+        self.filter_controls(ui);
+    }
+
+    fn volume_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Volume");
+            let label = match self.edits.volume {
+                Volume::Gain(_) => "Adjust",
+                Volume::Peak(_) => "Normalize peak",
+                Volume::Loudness(_) => "Normalize loudness",
+            };
+            egui::ComboBox::from_id_salt("volume-mode").selected_text(label).show_ui(ui, |ui| {
+                let v = &mut self.edits.volume;
+                if ui.selectable_label(matches!(v, Volume::Gain(_)), "Adjust").on_hover_text("Turn it up or down by a fixed amount").clicked() {
+                    *v = Volume::Gain(0.0);
+                }
+                if ui.selectable_label(matches!(v, Volume::Peak(_)), "Normalize peak").on_hover_text("Scale so the loudest moment reaches a set level").clicked() {
+                    *v = Volume::Peak(-1.0);
+                }
+                if ui.selectable_label(matches!(v, Volume::Loudness(_)), "Normalize loudness").on_hover_text("Scale to a set perceived loudness (EBU R128), so files sound equally loud").clicked() {
+                    *v = Volume::Loudness(-14.0);
+                }
+            });
+            match &mut self.edits.volume {
+                Volume::Gain(db) => {
+                    ui.add(egui::Slider::new(db, -24.0..=24.0).suffix(" dB").fixed_decimals(1));
+                }
+                Volume::Peak(db) => {
+                    ui.add(egui::Slider::new(db, -12.0..=0.0).suffix(" dBFS").fixed_decimals(1))
+                        .on_hover_text("−1 dBFS leaves a little room for lossy formats");
+                }
+                Volume::Loudness(lufs) => {
+                    ui.add(egui::Slider::new(lufs, -30.0..=-8.0).suffix(" LUFS").fixed_decimals(0))
+                        .on_hover_text("−14 suits music streaming, −16 podcasts, −23 broadcast (EBU R128)");
+                }
+            }
+            ui.separator();
+            match self.measurement() {
+                None => {
+                    ui.spinner();
+                    ui.weak("measuring…");
+                }
+                Some(m) => {
+                    let peak = if m.peak > 0.0 { format!("{:.1} dBFS", 20.0 * m.peak.log10()) } else { "silent".into() };
+                    let loud = if m.loudness.is_finite() { format!("{:.1} LUFS", m.loudness) } else { "– LUFS".into() };
+                    let (gain, limited) = self.volume();
+                    let mut text = format!("Peak {peak} · {loud}");
+                    if self.edits.volume.measures() {
+                        text += &format!(" → {:+.1} dB", 20.0 * gain.log10());
+                    }
+                    ui.weak(text).on_hover_text("Measured after trimming and filtering, before the volume change");
+                    if limited {
+                        ui.colored_label(ui.visuals().warn_fg_color, "⚠ peaks limited").on_hover_text(
+                            "This would push peaks past 0 dB, so a limiter turns them down just enough to keep them from clipping.",
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    fn filter_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Filters");
+            let cut = |ui: &mut egui::Ui, value: &mut Option<f32>, name: &str, help: &str, default: f32, range: std::ops::RangeInclusive<f32>| {
+                let mut on = value.is_some();
+                let mut hz = value.unwrap_or(default);
+                ui.checkbox(&mut on, name).on_hover_text(help);
+                ui.add_enabled(on, egui::Slider::new(&mut hz, range).logarithmic(true).suffix(" Hz").integer());
+                *value = on.then_some(hz);
+            };
+            cut(ui, &mut self.edits.low_cut, "Low-cut", "Remove low rumble and hum below this pitch", 80.0, 20.0..=1000.0);
+            cut(ui, &mut self.edits.high_cut, "High-cut", "Remove hiss and harsh highs above this pitch", 8000.0, 1000.0..=20000.0);
+            if ui.button("🗣 Voice").on_hover_text("Low-cut at 100 Hz and high-cut at 8 kHz: keeps speech, drops rumble and hiss").clicked() {
+                (self.edits.low_cut, self.edits.high_cut) = (Some(100.0), Some(8000.0));
+            }
+            ui.separator();
+            if ui.toggle_value(&mut self.edits.reverse, "⇆ Reverse").on_hover_text("Play the kept part backwards").changed() {
+                self.cursor = self.result_start();
+            }
+        });
     }
 
     fn trim_at_playhead(&mut self, start: bool) {
@@ -663,7 +855,7 @@ impl Session {
         let pad = 0.01;
         let rate = self.rate();
         self.set_trim(first as f64 / rate - pad, (last + 1) as f64 / rate + pad);
-        self.cursor = self.kept().0;
+        self.cursor = self.result_start();
     }
 
     fn shortcuts(&mut self, ui: &mut egui::Ui, outcome: &mut Outcome) {
@@ -676,10 +868,10 @@ impl Session {
             self.toggle_play();
         }
         if pressed(Modifiers::NONE, Key::Home) {
-            self.seek(self.kept().0);
+            self.seek(self.result_start());
         }
         if pressed(Modifiers::NONE, Key::End) {
-            self.seek(self.kept().1.saturating_sub(1));
+            self.seek(self.result_end());
         }
         if pressed(Modifiers::NONE, Key::I) {
             self.trim_at_playhead(true);
@@ -741,13 +933,17 @@ impl Session {
         let ch = self.info.channels as usize;
         let color = egui::Color32::from_rgb(WAVE_RGB[0], WAVE_RGB[1], WAVE_RGB[2]);
         let mid = h as f32 / 2.0;
+        let (vol, limited) = self.volume();
         for x in 0..w {
-            let f0 = a + len * x as u64 / w as u64;
-            let f1 = a + len * (x as u64 + 1) / w as u64;
+            // Output frames o0..o1, in the order they'll be heard.
+            let o0 = len * x as u64 / w as u64;
+            let o1 = (len * (x as u64 + 1) / w as u64).max(o0 + 1);
+            let (f0, f1) = if plan.reverse { (b - o1, b - o0) } else { (a + o0, a + o1) };
             let (lo, hi) = self.peaks.range(&self.samples, ch, f0 as usize, f1 as usize);
-            let g = plan.gain((f0 + f1) / 2 - a, len);
-            let top = (mid - hi * g * mid).floor().max(0.0) as usize;
-            let bottom = (mid - lo * g * mid).ceil().min(h as f32 - 1.0) as usize;
+            let g = plan.gain((o0 + o1) / 2, len) * vol;
+            let scale = |v: f32| if limited { (v * g).clamp(-CEILING, CEILING) } else { (v * g).clamp(-1.0, 1.0) };
+            let top = (mid - scale(hi) * mid).floor().max(0.0) as usize;
+            let bottom = (mid - scale(lo) * mid).ceil().min(h as f32 - 1.0) as usize;
             for y in top.min(h / 2)..=bottom.max(h / 2) {
                 img[(x, y)] = color;
             }
@@ -868,5 +1064,40 @@ mod tests {
         assert_eq!(e.audio().unwrap().trim_end, None);
         assert_eq!(t.size, THUMB);
         assert!((length - 4.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reversing_swaps_where_the_result_starts_and_which_fade_is_where() {
+        let mut s = session(5);
+        s.set_trim(1.0, 3.0);
+        assert_eq!((s.result_start(), s.result_end()), (1000, 2999));
+        s.edits.reverse = true;
+        assert_eq!((s.result_start(), s.result_end()), (2999, 1000));
+        // The left grip is now the fade-out (heard last), and fades can't overlap.
+        s.set_fade_side(true, 0.5);
+        s.set_fade_side(false, 5.0);
+        assert_eq!((s.edits.fade_out, s.edits.fade_in), (0.5, 1.5));
+    }
+
+    #[test]
+    fn normalizing_uses_a_background_measurement_of_the_kept_part() {
+        let ctx = egui::Context::default();
+        let mut s = session(5);
+        s.edits.volume = Volume::Peak(-6.0);
+        assert_eq!(s.volume(), (1.0, false), "no measurement yet: unchanged");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.measurement().is_none() {
+            s.update_measurement(&ctx, false);
+            assert!(std::time::Instant::now() < deadline, "measurement never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (gain, limited) = s.volume();
+        assert!((0.5 * gain - 10f32.powf(-6.0 / 20.0)).abs() < 1e-4 && !limited);
+        // Boosting past the ceiling engages the limiter.
+        s.edits.volume = Volume::Gain(12.0);
+        assert!(s.volume().1);
+        // A new trim invalidates it until measured again.
+        s.set_trim(1.5, 2.5);
+        assert!(s.measurement().is_none());
     }
 }

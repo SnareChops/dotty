@@ -794,7 +794,7 @@ fn edits_trim_and_fade_when_resaving_in_the_same_format() {
             trim_start: 0.5,
             trim_end: Some(1.5),
             fade_in: 0.1,
-            fade_out: 0.0,
+            ..Default::default()
         })],
     };
     let cancel = AtomicBool::new(false);
@@ -812,4 +812,34 @@ fn edits_trim_and_fade_when_resaving_in_the_same_format() {
     // Past the fade-in and away from the 5 ms cut fade at the end: untouched.
     assert_eq!(&out[2000..15_000], &samples[4000 * 2 + 2000..4000 * 2 + 15_000]);
     assert!(out[out.len() - 2].abs() < 200, "cut point fades out");
+}
+
+#[test]
+fn normalizing_measures_first_and_progress_never_goes_backwards() {
+    let dir = tmp("normalize");
+    let (src, dst) = (dir.join("in.wav"), dir.join("out.wav"));
+    make_wav(&src, 2, 8000, 16, &signal(2, 16_000, 16), &Tags::default());
+    let edits = dotty_core::Edits {
+        ops: vec![dotty_core::EditOp::Audio(dotty_core::AudioEdits {
+            trim_start: 0.25,
+            reverse: true,
+            low_cut: Some(100.0),
+            volume: dotty_core::Volume::Peak(-6.0),
+            ..Default::default()
+        })],
+    };
+    let cancel = AtomicBool::new(false);
+    let seen = std::sync::Mutex::new(Vec::new());
+    let progress = |p: f32| seen.lock().unwrap().push(p);
+    let options = Options::default();
+    let ctx = ConvertCtx::new(&options, &cancel, &progress).with_edits(Some(&edits));
+    AudioConverter::default().convert(&src, &dst, Format::Wav, Format::Wav, &ctx).unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(seen.windows(2).all(|w| w[1] >= w[0] || w[1] == 0.0), "{seen:?}");
+    assert_eq!(seen.last(), Some(&1.0));
+
+    let (info, out, _) = read_all(&dst, Format::Wav, 16);
+    assert_eq!(info.total_frames, Some(14_000));
+    let peak = out.iter().map(|s| s.unsigned_abs()).max().unwrap() as f32 / 32768.0;
+    assert!((20.0 * peak.log10() + 6.0).abs() < 0.05, "peak {peak}");
 }

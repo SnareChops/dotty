@@ -28,3 +28,5 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.resvg]
 opt-level = 3
+[profile.dev.package.ebur128]
+opt-level = 3

@@ -14,11 +14,18 @@ pub(crate) struct Metered<'a, 'c, S> {
     frames: u64,
     /// Reading stops here (a trim), so progress is measured against it.
     until: Option<u64>,
+    /// Where on the progress bar this read starts (a second pass starts after the first).
+    offset: f32,
 }
 
 impl<'a, 'c, S: AudioSource> Metered<'a, 'c, S> {
     pub fn new(inner: S, ctx: &'a ConvertCtx<'c>, share: f32) -> Self {
-        Self { inner, ctx, share, frames: 0, until: None }
+        Self { inner, ctx, share, frames: 0, until: None, offset: 0.0 }
+    }
+
+    pub fn offset(mut self, offset: f32) -> Self {
+        self.offset = offset;
+        self
     }
 
     pub fn until(mut self, frame: Option<u64>) -> Self {
@@ -45,7 +52,7 @@ impl<S: AudioSource> AudioSource for Metered<'_, '_, S> {
         let Some(chunk) = self.inner.next_chunk()? else { return Ok(None) };
         self.frames += chunk.len() as u64 / channels;
         if let Some(total) = total {
-            (self.ctx.progress)((self.share * self.frames as f32 / total as f32).min(0.99));
+            (self.ctx.progress)((self.offset + self.share * self.frames as f32 / total as f32).min(0.99));
         }
         Ok(Some(chunk))
     }

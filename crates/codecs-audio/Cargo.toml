@@ -13,3 +13,4 @@ rusty_mp3 = "1.0.5"
 # No "aac": AAC still requires a patent licence.
 symphonia = { version = "0.6.1", default-features = false, features = ["mpa", "flac", "vorbis", "alac", "adpcm", "pcm", "wav", "aiff", "caf", "isomp4", "mkv", "ogg", "all-meta"] }
 dotty-core = { version = "0.1.0", path = "../dotty-core" }
+ebur128 = "0.1.11"

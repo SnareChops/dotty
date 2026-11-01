@@ -237,10 +237,23 @@ impl Converter for AudioConverter {
         {
             let audio_edits = ctx.edits.and_then(|e| e.audio()).filter(|a| !a.is_noop());
             let plan = audio_edits.map(|a| edit::Plan::new(a, info.sample_rate, info.total_frames));
-            let metered = Metered::new(&mut decoded, ctx, encoder.read_share()).until(plan.and_then(|p| p.end));
+            let until = plan.and_then(|p| p.end);
+            // Normalizing reads the file twice: once to measure, once to write.
+            let measuring = audio_edits.is_some_and(|a| a.volume.measures());
+            let share = encoder.read_share();
+            let (pass1, pass2) = if measuring { (share * 0.3, share * 0.7) } else { (0.0, share) };
+            let measured = match audio_edits {
+                Some(a) if measuring => {
+                    let mut again = self.open(src, from)?;
+                    let metered = Metered::new(&mut again, ctx, pass1).until(until);
+                    Some(edit::measure(edit::shape(Box::new(metered), a), None)?)
+                }
+                _ => None,
+            };
+            let metered = Metered::new(&mut decoded, ctx, pass2).offset(pass1).until(until);
             let mut chain: Box<dyn AudioSource + '_> = Box::new(metered);
             if let Some(a) = audio_edits {
-                chain = edit::apply(chain, a);
+                chain = edit::apply(chain, a, measured.as_ref());
             }
             let wanted = match ctx.options.choice(to, &CHANNELS) {
                 "mono" => 1,

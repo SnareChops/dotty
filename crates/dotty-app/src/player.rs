@@ -4,7 +4,7 @@
 //! into a lock-free ring buffer; the device callback only copies samples out of it.
 
 use codecs_audio::StreamInfo;
-use codecs_audio::edit::{Plan, preview};
+use codecs_audio::edit::{Measurement, Plan, preview};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use dotty_core::AudioEdits;
@@ -21,6 +21,8 @@ pub struct Request {
     pub samples: Arc<[f32]>,
     pub info: StreamInfo,
     pub edits: AudioEdits,
+    /// The level the volume stage normalizes from, if measured yet.
+    pub measured: Option<Measurement>,
     /// Source frame to start at.
     pub from: u64,
     /// Start over from the kept range's beginning on reaching its end.
@@ -75,14 +77,12 @@ impl Player {
     pub fn position(&self) -> Option<u64> {
         let p = self.playing.as_ref()?;
         let heard = p.played.load(Ordering::Relaxed) as f64 * p.source_rate as f64 / p.device_rate as f64;
-        let heard = heard as u64;
         let end = p.plan.end.unwrap_or(p.total);
-        let first = end.saturating_sub(p.from);
-        if heard < first || !p.looping {
-            return Some((p.from + heard).min(end));
-        }
         let len = end.saturating_sub(p.plan.start).max(1);
-        Some(p.plan.start + (heard - first) % len)
+        // Work in output order (which runs backwards through the source when reversed).
+        let at = p.plan.output_index(p.from, end) + heard as u64;
+        let at = if p.looping { at % len } else { at.min(len - 1) };
+        Some(if p.plan.reverse { end - 1 - at } else { p.plan.start + at })
     }
 
     pub fn play(&mut self, req: Request) -> Result<(), String> {
@@ -129,11 +129,14 @@ impl Player {
         }?;
 
         {
-            let (stop, samples, info, edits, looping) = (stop.clone(), req.samples, req.info, req.edits, req.looping);
+            let (stop, samples, info, edits, measured, looping) =
+                (stop.clone(), req.samples, req.info, req.edits, req.measured, req.looping);
+            // Where the result begins, for looping back.
+            let restart = if plan.reverse { plan.end.unwrap_or(total).saturating_sub(1) } else { plan.start };
             thread::spawn(move || {
                 let mut start = from;
                 loop {
-                    let Ok(mut src) = preview(samples.clone(), &info, &edits, start, channels, rate) else { break };
+                    let Ok(mut src) = preview(samples.clone(), &info, &edits, measured.as_ref(), start, channels, rate) else { break };
                     while let Ok(Some(chunk)) = src.next_chunk() {
                         let mut rest = chunk;
                         while !rest.is_empty() {
@@ -154,7 +157,7 @@ impl Player {
                     if !looping || stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    start = plan.start;
+                    start = restart;
                 }
                 produced_all.store(true, Ordering::Relaxed);
             });
@@ -227,7 +230,7 @@ mod tests {
         let info = StreamInfo { sample_rate: rate, channels: 1, source_bits: Some(16), total_frames: Some(rate as u64 / 2), source_rate: rate };
         let edits = AudioEdits { trim_start: 0.1, fade_out: 0.1, ..Default::default() };
         let mut p = Player::default();
-        p.play(Request { samples, info, edits, from: 0, looping: false }).unwrap();
+        p.play(Request { samples, info, edits, measured: None, from: 0, looping: false }).unwrap();
         assert!(p.is_playing());
         thread::sleep(Duration::from_millis(200));
         let pos = p.position().unwrap();
