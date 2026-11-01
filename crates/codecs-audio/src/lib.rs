@@ -85,7 +85,27 @@ impl<S: AudioSource + ?Sized> AudioSource for Box<S> {
 /// Opens one container/codec as an [`AudioSource`].
 pub trait AudioDecoder: Send + Sync {
     fn format(&self) -> Format;
+    /// The file's default audio track.
     fn open(&self, path: &Path) -> Result<Box<dyn AudioSource>>;
+    /// Audio track `track` (in container order, as [`AudioDecoder::tracks`] lists them).
+    fn open_track(&self, path: &Path, track: u32) -> Result<Box<dyn AudioSource>> {
+        if track == 0 { self.open(path) } else { Err(Error::Codec(format!("this file has no audio track {}", track + 1))) }
+    }
+    /// The file's audio tracks, for a picker; empty when the format only holds one.
+    fn tracks(&self, _path: &Path) -> Vec<AudioTrack> {
+        Vec::new()
+    }
+}
+
+/// One audio track of a file, as offered in the editor's track picker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioTrack {
+    /// "Opus, stereo, English".
+    pub label: String,
+    /// The one used unless another is picked.
+    pub default: bool,
+    /// Whether it can be decoded (an AAC track can't).
+    pub supported: bool,
 }
 
 /// Writes one format from an [`AudioSource`]. The pipeline adapts the stream to the
@@ -177,7 +197,8 @@ impl Default for AudioConverter {
     fn default() -> Self {
         let mut c = Self::empty();
         use Format::*;
-        for f in [Wav, Flac, Mp3, Ogg, Aiff, Caf, M4a, Mka, Mp2] {
+        // Videos too: their soundtrack converts like any audio file.
+        for f in [Wav, Flac, Mp3, Ogg, Aiff, Caf, M4a, Mka, Mp2, Mp4, Mov, Mkv, Webm] {
             c.add_decoder(SymphoniaDecoder(f));
         }
         c.add_decoder(OggOpusDecoder);
@@ -206,8 +227,21 @@ impl AudioConverter {
 
     /// Open `path` with the decoder registered for `from`.
     pub fn open(&self, path: &Path, from: Format) -> Result<Box<dyn AudioSource>> {
+        self.open_track(path, from, None)
+    }
+
+    /// Open audio track `track` (`None` = the default one).
+    pub fn open_track(&self, path: &Path, from: Format, track: Option<u32>) -> Result<Box<dyn AudioSource>> {
         let d = self.decoders.iter().find(|d| d.format() == from).ok_or(Error::UnknownFormat)?;
-        d.open(path)
+        match track {
+            Some(t) => d.open_track(path, t),
+            None => d.open(path),
+        }
+    }
+
+    /// The file's audio tracks (empty when there's only ever one).
+    pub fn tracks(&self, path: &Path, from: Format) -> Vec<AudioTrack> {
+        self.decoders.iter().find(|d| d.format() == from).map(|d| d.tracks(path)).unwrap_or_default()
     }
 }
 
@@ -228,7 +262,8 @@ impl Converter for AudioConverter {
     fn convert(&self, src: &Path, dst: &Path, from: Format, to: Format, ctx: &ConvertCtx) -> Result<()> {
         let encoder = self.encoders.iter().find(|e| e.format() == to).ok_or(Error::NoRoute { from, to })?;
         (ctx.progress)(0.0);
-        let mut decoded = self.open(src, from)?;
+        let track = ctx.edits.and_then(|e| e.audio()).and_then(|a| a.track);
+        let mut decoded = self.open_track(src, from, track)?;
         let info = decoded.info().clone();
         let tags = if ctx.options.strip_metadata { Tags::default() } else { decoded.tags().clone() };
 
@@ -260,7 +295,7 @@ impl Converter for AudioConverter {
             let (pass1, pass2) = if measuring { (share * 0.3, share * 0.7) } else { (0.0, share) };
             let measured = match audio_edits {
                 Some(a) if measuring => {
-                    let mut again = self.open(src, from)?;
+                    let mut again = self.open_track(src, from, track)?;
                     let metered = Metered::new(&mut again, ctx, pass1).until(until);
                     Some(edit::measure(edit::shape_to(Box::new(metered), a, channels)?, None)?)
                 }

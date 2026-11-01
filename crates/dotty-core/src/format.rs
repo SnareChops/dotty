@@ -6,6 +6,7 @@ use std::path::Path;
 pub enum Kind {
     Image,
     Audio,
+    Video,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -37,10 +38,14 @@ pub enum Format {
     M4a,
     Mka,
     Mp2,
+    Mp4,
+    Mov,
+    Mkv,
+    Webm,
 }
 
 impl Format {
-    pub const ALL: [Format; 27] = [
+    pub const ALL: [Format; 31] = [
         Format::Png,
         Format::Jpeg,
         Format::Gif,
@@ -68,6 +73,10 @@ impl Format {
         Format::M4a,
         Format::Mka,
         Format::Mp2,
+        Format::Mp4,
+        Format::Mov,
+        Format::Mkv,
+        Format::Webm,
     ];
 
     pub fn kind(self) -> Kind {
@@ -77,6 +86,7 @@ impl Format {
                 Kind::Image
             }
             Wav | Flac | Mp3 | Ogg | Opus | Aiff | Caf | M4a | Mka | Mp2 => Kind::Audio,
+            Mp4 | Mov | Mkv | Webm => Kind::Video,
         }
     }
 
@@ -110,6 +120,10 @@ impl Format {
             Format::M4a => "m4a",
             Format::Mka => "mka",
             Format::Mp2 => "mp2",
+            Format::Mp4 => "mp4",
+            Format::Mov => "mov",
+            Format::Mkv => "mkv",
+            Format::Webm => "webm",
         }
     }
 
@@ -154,7 +168,21 @@ impl Format {
     }
 
     pub fn is_lossy(self) -> bool {
-        matches!(self, Format::Jpeg | Format::Avif | Format::Dds | Format::Mp3 | Format::Ogg | Format::Opus | Format::Mp2)
+        // Videos almost always carry lossy video and sound.
+        matches!(
+            self,
+            Format::Jpeg
+                | Format::Avif
+                | Format::Dds
+                | Format::Mp3
+                | Format::Ogg
+                | Format::Opus
+                | Format::Mp2
+                | Format::Mp4
+                | Format::Mov
+                | Format::Mkv
+                | Format::Webm
+        )
     }
 
     fn from_extension(ext: &str) -> Option<Format> {
@@ -184,7 +212,11 @@ impl Format {
             "aif" | "aiff" | "aifc" => Format::Aiff,
             "caf" => Format::Caf,
             "m4a" | "m4b" | "alac" => Format::M4a,
-            "mka" | "weba" | "webm" => Format::Mka,
+            "mka" | "weba" => Format::Mka,
+            "mp4" | "m4v" => Format::Mp4,
+            "mov" | "qt" => Format::Mov,
+            "mkv" => Format::Mkv,
+            "webm" => Format::Webm,
             "mp2" | "mp1" | "mpa" | "m2a" => Format::Mp2,
             _ => return None,
         })
@@ -211,8 +243,13 @@ impl Format {
             Some(Format::Webp)
         } else if at(4, b"ftyp") && (at(8, b"avif") || at(8, b"avis")) {
             Some(Format::Avif)
-        } else if at(4, b"ftyp") && (at(8, b"M4A ") || at(8, b"M4B ") || at(8, b"mp42") || at(8, b"isom")) {
+        } else if at(4, b"ftyp") && (at(8, b"M4A ") || at(8, b"M4B ")) {
             Some(Format::M4a)
+        } else if at(4, b"ftyp") && at(8, b"qt  ") {
+            Some(Format::Mov)
+        } else if at(4, b"ftyp") && !HEIF_BRANDS.iter().any(|b| at(8, b)) {
+            // Any other ISO media file: audio or video, `probe::refine` looks at the tracks.
+            Some(Format::Mp4)
         } else if starts(&[0xFF, 0x0A]) || starts(b"\0\0\0\x0cJXL \r\n\x87\n") {
             Some(Format::Jxl)
         } else if starts(b"qoif") {
@@ -236,7 +273,8 @@ impl Format {
         } else if starts(b"caff") {
             Some(Format::Caf)
         } else if starts(&[0x1A, 0x45, 0xDF, 0xA3]) {
-            Some(Format::Mka)
+            // Matroska or WebM, audio or video: `probe::refine` looks at the tracks.
+            Some(Format::Mkv)
         } else if starts(b"fLaC") {
             Some(Format::Flac)
         } else if starts(b"OggS") {
@@ -256,16 +294,20 @@ impl Format {
         }
     }
 
-    /// Detect from content first, falling back to the file extension.
+    /// Detect from content first, falling back to the file extension. Containers that hold
+    /// either audio or video (MP4/MOV, Matroska/WebM) are looked inside to tell which.
     pub fn detect(path: &Path) -> Option<Format> {
         let mut head = [0u8; 64];
         let n = std::fs::File::open(path)
             .and_then(|mut f| f.read(&mut head))
             .unwrap_or(0);
-        Format::sniff(&head[..n])
-            .or_else(|| path.extension()?.to_str().and_then(Format::from_extension))
+        let f = Format::sniff(&head[..n]).or_else(|| path.extension()?.to_str().and_then(Format::from_extension))?;
+        Some(crate::probe::refine(path, f))
     }
 }
+
+/// ISO media brands of HEIF/HEIC still images, which aren't supported.
+const HEIF_BRANDS: [&[u8]; 7] = [b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1"];
 
 impl fmt::Display for Format {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -287,6 +329,10 @@ mod tests {
         assert_eq!(Format::sniff(b"ID3\x04"), Some(Format::Mp3));
         assert_eq!(Format::sniff(b"\0\0\0\x1cftypavif"), Some(Format::Avif));
         assert_eq!(Format::sniff(b"\0\0\0\x1cftypM4A "), Some(Format::M4a));
+        assert_eq!(Format::sniff(b"\0\0\0\x1cftypisom"), Some(Format::Mp4));
+        assert_eq!(Format::sniff(b"\0\0\0\x14ftypqt  "), Some(Format::Mov));
+        assert_eq!(Format::sniff(b"\0\0\0\x18ftypheic"), None);
+        assert_eq!(Format::sniff(&[0x1A, 0x45, 0xDF, 0xA3, 0x9F]), Some(Format::Mkv));
         assert_eq!(Format::sniff(b"FORM\0\0\0\0AIFFCOMM"), Some(Format::Aiff));
         assert_eq!(Format::sniff(b"P6\n4 4\n255\n"), Some(Format::Pnm));
         assert_eq!(Format::sniff(b"  <svg xmlns="), Some(Format::Svg));

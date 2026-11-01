@@ -5,6 +5,7 @@ pub mod edit;
 pub mod format;
 pub mod jobs;
 pub mod output;
+pub mod probe;
 pub mod registry;
 
 pub use edit::{AudioEdits, Caption, CaptionFont, Captions, Channels, Drawing, Echo, EditOp, Edits, Mask, Region, Reverb, Stroke, Volume};

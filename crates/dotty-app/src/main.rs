@@ -73,7 +73,16 @@ struct Entry {
 
 impl Entry {
     fn editable(&self) -> bool {
-        matches!(self.from.kind(), Kind::Image | Kind::Audio)
+        self.edits_as().is_some()
+    }
+
+    /// Which editor this entry opens: a video going to an audio format gets the audio
+    /// editor for its soundtrack.
+    fn edits_as(&self) -> Option<Kind> {
+        match self.from.kind() {
+            Kind::Video => self.to.filter(|t| t.kind() == Kind::Audio).map(|_| Kind::Audio),
+            k => Some(k),
+        }
     }
 
     /// Whether the edits made parts of the image transparent.
@@ -157,7 +166,7 @@ impl App {
                 skipped += 1;
                 continue;
             };
-            let to = self.registry.targets(from).into_iter().next();
+            let to = self.default_target(from);
             self.next_id += 1;
             if from.multi_image_input() {
                 probe.push((self.next_id, path.clone(), from));
@@ -176,6 +185,16 @@ impl App {
             });
         }
         self.notice = (skipped > 0).then(|| format!("{skipped} file(s) skipped: unsupported type"));
+    }
+
+    /// The target a newly added file starts with: the first reachable format, except that a
+    /// video's soundtrack most often goes to MP3.
+    fn default_target(&self, from: Format) -> Option<Format> {
+        let targets = self.registry.targets(from);
+        if from.kind() == Kind::Video && targets.contains(&Format::Mp3) {
+            return Some(Format::Mp3);
+        }
+        targets.into_iter().next()
     }
 
     fn pump_events(&mut self) {
@@ -231,8 +250,8 @@ impl App {
 
     fn open_editor(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.entries[i];
-        self.editor = Some(match e.from.kind() {
-            Kind::Audio => {
+        self.editor = Some(match e.edits_as() {
+            Some(Kind::Audio) => {
                 // Normalizing in the editor measures the layout the target will be written in.
                 let output_channels = e.to.and_then(|to| match self.options.choice(to, &codecs_audio::CHANNELS) {
                     "mono" => Some(1),
@@ -401,7 +420,7 @@ impl App {
     }
 
     fn supported_formats(&self, ui: &mut egui::Ui) {
-        for (kind, name) in [(Kind::Image, "Images"), (Kind::Audio, "Audio")] {
+        for (kind, name) in [(Kind::Image, "Images"), (Kind::Audio, "Audio"), (Kind::Video, "Video (sound only for now)")] {
             let list: Vec<String> = Format::ALL
                 .into_iter()
                 .filter(|f| f.kind() == kind && !self.registry.targets(*f).is_empty())
@@ -415,7 +434,7 @@ impl App {
 
     /// "All images → [format]" shortcuts for every kind present in the list.
     fn bulk_targets(&mut self, ui: &mut egui::Ui) {
-        for (kind, label) in [(Kind::Image, "images"), (Kind::Audio, "audio files")] {
+        for (kind, label) in [(Kind::Image, "images"), (Kind::Audio, "audio files"), (Kind::Video, "videos")] {
             let members: Vec<usize> = (0..self.entries.len())
                 .filter(|&i| self.entries[i].from.kind() == kind && !self.entries[i].status.busy())
                 .collect();
@@ -490,7 +509,8 @@ impl App {
                         e.status = Status::Ready; // a new target means convert again
                     }
                     if e.editable() {
-                        let audio = e.from.kind() == Kind::Audio;
+                        let audio = e.edits_as() == Some(Kind::Audio);
+                        let video = e.from.kind() == Kind::Video;
                         let backing = (!audio).then_some(checker);
                         if let Some(tex) = &e.preview {
                             let side = if audio { 44.0 } else { 22.0 };
@@ -509,7 +529,9 @@ impl App {
                             });
                         }
                         let label = if e.edits.is_some() { "Edit •" } else { "Edit" };
-                        let help = if audio {
+                        let help = if video {
+                            "Edit the soundtrack before converting: trim, fade, change speed or pitch, filter, add effects or change the volume"
+                        } else if audio {
                             "Trim, fade, change speed or pitch, filter, reverse, add echo or reverb, or change the volume before converting"
                         } else {
                             "Remove the background, draw, add text or crop before converting"
@@ -959,6 +981,28 @@ mod tests {
             app.pump_events();
         }
         assert!(app.entries[0].multi, "the probe found both frames");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_video_converts_its_soundtrack_and_edits_it_as_audio() {
+        let dir = std::env::temp_dir().join(format!("tf-app-video-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("clip.mkv");
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../codecs-audio/tests/fixtures/video_two_tracks.mkv"), &video).unwrap();
+
+        let mut app = app();
+        app.add_files([video]);
+        let e = &app.entries[0];
+        assert_eq!((e.from, e.from.kind()), (Format::Mkv, Kind::Video));
+        assert_eq!(e.to, Some(Format::Mp3), "a video's sound goes to MP3 by default");
+        assert!(app.targets(e).iter().all(|t| t.kind() == Kind::Audio), "only sound can be written for now");
+        assert_eq!(e.edits_as(), Some(Kind::Audio), "Edit opens the audio editor on the soundtrack");
+
+        app.convert_all();
+        wait_idle(&mut app);
+        assert!(matches!(app.entries[0].status, Status::Done(..)), "soundtrack conversion finished");
+        assert!(dir.join("clip.mp3").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

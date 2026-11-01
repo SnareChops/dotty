@@ -1351,8 +1351,9 @@ pub fn measure_memory(
 }
 
 /// Decode a whole file into memory for the editor. Fails if it's longer than `max_secs`.
-pub fn decode_all(path: &Path, from: Format, max_secs: u64, cancel: &AtomicBool) -> Result<(Arc<[f32]>, StreamInfo)> {
-    let mut src = AudioConverter::default().open(path, from)?;
+/// `track` picks an audio track (`None` = the file's default).
+pub fn decode_all(path: &Path, from: Format, track: Option<u32>, max_secs: u64, cancel: &AtomicBool) -> Result<(Arc<[f32]>, StreamInfo)> {
+    let mut src = AudioConverter::default().open_track(path, from, track)?;
     let info = src.info().clone();
     let limit = max_secs * info.sample_rate as u64 * info.channels as u64;
     let too_long = || Error::Codec(format!("longer than {} minutes, too long to edit", max_secs / 60));

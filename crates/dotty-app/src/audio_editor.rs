@@ -4,7 +4,7 @@
 
 use crate::player::{Player, Request};
 use codecs_audio::StreamInfo;
-use codecs_audio::AudioSource;
+use codecs_audio::{AudioConverter, AudioSource, AudioTrack};
 use codecs_audio::edit::{CEILING, Measurement, MemorySource, Plan, decode_all, limits, measure_memory, volume_gain, with_channels};
 use dotty_core::{AudioEdits, Channels, EditOp, Edits, Format, JobId, Reverb, Volume};
 use eframe::egui;
@@ -37,14 +37,19 @@ pub enum Outcome {
 pub struct AudioEditor {
     pub entry: JobId,
     title: String,
+    path: PathBuf,
+    from: Format,
     state: State,
     cancel: Arc<AtomicBool>,
     /// The output format's channel setting (`None` = keep), so normalizing measures the
     /// layout that gets written.
     output_channels: Option<u16>,
+    /// The file's audio tracks when it has several (videos often do), else empty.
+    tracks: Vec<AudioTrack>,
 }
 
-type Loaded = Result<(Arc<[f32]>, StreamInfo, Peaks), String>;
+/// The file's tracks (listed even if the picked one fails) and the decoded track.
+type Loaded = (Vec<AudioTrack>, Result<(Arc<[f32]>, StreamInfo, Peaks), String>);
 
 enum State {
     Loading(mpsc::Receiver<Loaded>, Option<AudioEdits>),
@@ -68,30 +73,53 @@ impl AudioEditor {
         output_channels: Option<u16>,
     ) -> Self {
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let existing = existing.and_then(|e| e.audio().copied());
+        let (rx, cancel) = Self::load(ctx, path.clone(), from, existing.and_then(|e| e.track));
+        Self { entry, title, path, from, state: State::Loading(rx, existing), cancel, output_channels, tracks: Vec::new() }
+    }
+
+    /// Decode `track` of the file (and list its tracks) in the background.
+    fn load(ctx: &egui::Context, path: PathBuf, from: Format, track: Option<u32>) -> (mpsc::Receiver<Loaded>, Arc<AtomicBool>) {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let (ctx, stop) = (ctx.clone(), cancel.clone());
         std::thread::spawn(move || {
-            let result = decode_all(&path, from, MAX_SECS, &stop).map(|(samples, info)| {
+            let tracks = AudioConverter::default().tracks(&path, from);
+            let tracks = if tracks.len() > 1 { tracks } else { Vec::new() };
+            let result = decode_all(&path, from, track, MAX_SECS, &stop).map(|(samples, info)| {
                 let peaks = Peaks::new(&samples, info.channels as usize);
                 (samples, info, peaks)
             });
-            let _ = tx.send(result.map_err(|e| e.to_string()));
+            let _ = tx.send((tracks, result.map_err(|e| e.to_string())));
             ctx.request_repaint();
         });
-        let existing = existing.and_then(|e| e.audio().copied());
-        Self { entry, title, state: State::Loading(rx, existing), cancel, output_channels }
+        (rx, cancel)
+    }
+
+    /// Reload with another audio track, keeping the other edits.
+    fn switch_track(&mut self, ctx: &egui::Context, mut edits: AudioEdits, track: u32) {
+        let default = self.tracks.iter().position(|t| t.default).unwrap_or(0) as u32;
+        edits.track = (track != default).then_some(track);
+        self.cancel.store(true, Ordering::Relaxed);
+        let (rx, cancel) = Self::load(ctx, self.path.clone(), self.from, edits.track);
+        self.cancel = cancel;
+        self.state = State::Loading(rx, Some(edits));
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Outcome {
         if let State::Loading(rx, existing) = &mut self.state {
             match rx.try_recv() {
-                Ok(Ok((samples, info, peaks))) => {
+                Ok((tracks, Ok((samples, info, peaks)))) => {
+                    self.tracks = tracks;
                     let mut session = Session::new(samples, info, peaks, existing.unwrap_or_default());
                     session.output_channels = self.output_channels;
+                    session.tracks = self.tracks.clone();
                     self.state = State::Ready(Box::new(session))
                 }
-                Ok(Err(e)) => self.state = State::Failed(e),
+                Ok((tracks, Err(e))) => {
+                    self.tracks = tracks;
+                    self.state = State::Failed(e);
+                }
                 Err(mpsc::TryRecvError::Disconnected) => self.state = State::Failed("couldn't open the file".into()),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -100,6 +128,8 @@ impl AudioEditor {
         let size = (screen.size() - egui::vec2(48.0, 48.0)).max(egui::vec2(320.0, 240.0));
         let size = egui::vec2(size.x, size.y.min(560.0));
         let mut outcome = Outcome::Open;
+        let mut switch = None;
+        let tracks = self.tracks.clone();
         egui::Modal::new(egui::Id::unique("audio-editor")).show(ctx, |ui| {
             ui.set_min_size(size);
             ui.set_max_size(size);
@@ -118,13 +148,30 @@ impl AudioEditor {
                 State::Failed(msg) => {
                     ui.strong(&self.title);
                     ui.colored_label(ui.visuals().error_fg_color, format!("✖ Couldn't open this file for editing: {msg}"));
+                    // Another track may work (a video's default track can be AAC).
+                    if !tracks.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("Try another audio track:");
+                            if let Some(t) = track_picker(ui, &tracks, None) {
+                                switch = Some((AudioEdits::default(), t));
+                            }
+                        });
+                    }
                     if ui.button("Close").clicked() {
                         outcome = Outcome::Cancelled;
                     }
                 }
-                State::Ready(session) => outcome = session.ui(ui, &self.title),
+                State::Ready(session) => {
+                    outcome = session.ui(ui, &self.title);
+                    if let Some(t) = session.switch_track.take() {
+                        switch = Some((session.edits, t));
+                    }
+                }
             }
         });
+        if let Some((edits, track)) = switch {
+            self.switch_track(ctx, edits, track);
+        }
         outcome
     }
 }
@@ -231,6 +278,9 @@ struct Session {
     output_channels: Option<u16>,
     /// The mono → stereo width last set, kept while another channel setting is picked.
     width: f32,
+    /// The file's audio tracks when it has several, and one picked to switch to.
+    tracks: Vec<AudioTrack>,
+    switch_track: Option<u32>,
 }
 
 /// A measurement running in the background; dropping it cancels it.
@@ -302,6 +352,8 @@ impl Session {
             slice: None,
             controls_height: 180.0,
             output_channels: None,
+            tracks: Vec::new(),
+            switch_track: None,
             width: match edits.channels {
                 Channels::Stereo { width } => width,
                 _ => 0.0,
@@ -530,6 +582,14 @@ impl Session {
 
         ui.horizontal_wrapped(|ui| {
             ui.strong(title);
+            if !self.tracks.is_empty() {
+                ui.separator();
+                let current = self.edits.track.or_else(|| self.tracks.iter().position(|t| t.default).map(|i| i as u32));
+                if let Some(t) = track_picker(ui, &self.tracks, current) {
+                    self.player.stop();
+                    self.switch_track = Some(t);
+                }
+            }
             ui.separator();
             let playing = self.player.is_playing();
             if ui.button(if playing { "⏸ Pause" } else { "▶ Play" }).on_hover_text("Play the result (Space)").clicked() {
@@ -1243,6 +1303,27 @@ fn render_channels(samples: Arc<[f32]>, info: &StreamInfo, c: Channels, lo: u64,
     Some((out, ch))
 }
 
+/// A combo box of audio tracks; returns a newly picked one.
+fn track_picker(ui: &mut egui::Ui, tracks: &[AudioTrack], current: Option<u32>) -> Option<u32> {
+    let name = |i: usize, t: &AudioTrack| format!("Track {}: {}", i + 1, t.label);
+    let shown = current.and_then(|c| tracks.get(c as usize).map(|t| name(c as usize, t))).unwrap_or_else(|| "Pick a track".into());
+    let mut picked = None;
+    egui::ComboBox::from_id_salt("audio-track")
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            for (i, t) in tracks.iter().enumerate() {
+                let label = if t.supported { name(i, t) } else { format!("{} (can't be read)", name(i, t)) };
+                let resp = ui.add_enabled(t.supported, egui::Button::selectable(current == Some(i as u32), label));
+                if resp.clicked() && current != Some(i as u32) {
+                    picked = Some(i as u32);
+                }
+            }
+        })
+        .response
+        .on_hover_text("This file has several audio tracks (languages, commentary…): pick the one to use");
+    picked
+}
+
 /// A time text box: shows `value` until edited; returns a newly typed value on Enter or
 /// leaving the box.
 fn time_field(ui: &mut egui::Ui, text: &mut String, value: f64) -> Option<f64> {
@@ -1473,5 +1554,18 @@ mod tests {
         assert_eq!(ch, 2);
         let (_, hi) = scan(&data, 2, 0, 2000);
         assert!(hi > 0.6, "widening adds to one side: peak {hi}");
+    }
+
+    #[test]
+    fn the_loader_lists_a_videos_tracks_and_decodes_the_picked_one() {
+        let ctx = egui::Context::default();
+        let path = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../codecs-audio/tests/fixtures/video_two_tracks.mkv"));
+        let (rx, _cancel) = AudioEditor::load(&ctx, path, Format::Mkv, Some(1));
+        let (tracks, decoded) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(tracks.len(), 2);
+        let (samples, info, _) = decoded.unwrap();
+        let ups = samples.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        let hz = ups as f64 * info.sample_rate as f64 / samples.len() as f64;
+        assert!((hz - 880.0).abs() < 15.0, "track 2 is the 880 Hz one, got {hz}");
     }
 }

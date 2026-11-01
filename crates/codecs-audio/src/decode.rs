@@ -3,17 +3,18 @@
 //! Ogg Opus files go straight through `opus-pure`.
 
 use crate::tags::Tags;
-use crate::{AudioDecoder, AudioSource, StreamInfo};
+use crate::{AudioDecoder, AudioSource, AudioTrack, StreamInfo};
 use opus_pure::{MAX_PACKET_SAMPLES, OggOpusReader, OggPacket, OpusDecoder, Trim};
 use std::fs::File;
 use std::io::BufReader;
 use std::ops::Range;
 use std::path::Path;
-use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_OPUS};
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::well_known::*;
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder as SymDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
+use symphonia::core::formats::{FormatOptions, FormatReader, Track, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag};
 use dotty_core::{Error, Format, Result};
@@ -26,8 +27,78 @@ impl AudioDecoder for SymphoniaDecoder {
         self.0
     }
     fn open(&self, path: &Path) -> Result<Box<dyn AudioSource>> {
-        Ok(Box::new(SymphoniaSource::open(path, self.0)?))
+        Ok(Box::new(SymphoniaSource::open(path, self.0, None)?))
     }
+    fn open_track(&self, path: &Path, track: u32) -> Result<Box<dyn AudioSource>> {
+        Ok(Box::new(SymphoniaSource::open(path, self.0, Some(track as usize))?))
+    }
+    fn tracks(&self, path: &Path) -> Vec<AudioTrack> {
+        let Ok(format) = probe(path, self.0) else { return Vec::new() };
+        let default = format.default_track(TrackType::Audio).map(|t| t.id);
+        audio_tracks(format.as_ref())
+            .into_iter()
+            .map(|t| {
+                let params = t.codec_params.as_ref().and_then(|p| p.audio());
+                let codec = params.map(|p| p.codec).unwrap_or_default();
+                let mut label = codec_name(codec).to_string();
+                if let Some(n) = params.and_then(|p| p.channels.as_ref()).map(|c| c.count()) {
+                    label += match n {
+                        1 => ", mono",
+                        2 => ", stereo",
+                        _ => "",
+                    };
+                    if n > 2 {
+                        label += &format!(", {n} channels");
+                    }
+                }
+                if let Some(lang) = t.language.as_deref().filter(|l| !l.is_empty() && *l != "und") {
+                    label += &format!(", {lang}");
+                }
+                let supported = params.is_some_and(|p| unsupported_reason(p.codec).is_none());
+                AudioTrack { label, default: Some(t.id) == default, supported }
+            })
+            .collect()
+    }
+}
+
+/// The audio tracks of a container, in order.
+fn audio_tracks(format: &dyn FormatReader) -> Vec<&Track> {
+    format.tracks().iter().filter(|t| matches!(t.codec_params, Some(CodecParameters::Audio(_)))).collect()
+}
+
+fn codec_name(id: symphonia::core::codecs::audio::AudioCodecId) -> &'static str {
+    match id {
+        CODEC_ID_OPUS => "Opus",
+        CODEC_ID_VORBIS => "Vorbis",
+        CODEC_ID_FLAC => "FLAC",
+        CODEC_ID_ALAC => "ALAC",
+        CODEC_ID_MP3 => "MP3",
+        CODEC_ID_MP2 => "MP2",
+        CODEC_ID_MP1 => "MP1",
+        CODEC_ID_AAC => "AAC",
+        CODEC_ID_AC3 => "AC-3",
+        CODEC_ID_EAC3 => "E-AC-3",
+        // The PCM family sits in 0x100..=0x125 (no accessor for the number).
+        _ if (CODEC_ID_PCM_S32LE..=CODEC_ID_PCM_MULAW).contains(&id) => "PCM",
+        _ => "Other",
+    }
+}
+
+/// Why a codec can't be decoded, if it can't.
+fn unsupported_reason(id: symphonia::core::codecs::audio::AudioCodecId) -> Option<&'static str> {
+    match id {
+        CODEC_ID_AAC => Some("AAC, which isn't supported (AAC still requires a patent licence)"),
+        CODEC_ID_AC3 | CODEC_ID_EAC3 => Some("Dolby Digital (AC-3), which isn't supported yet"),
+        _ => None,
+    }
+}
+
+fn probe(path: &Path, from: Format) -> Result<Box<dyn FormatReader>> {
+    let file = File::open(path).map_err(|source| Error::Io { path: path.into(), source })?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(from.extension());
+    symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default()).map_err(sym_err)
 }
 
 pub struct OggOpusDecoder;
@@ -51,10 +122,8 @@ enum PacketDecoder {
 
 impl PacketDecoder {
     fn new(params: &AudioCodecParameters) -> Result<Self> {
-        if params.codec == CODEC_ID_AAC {
-            return Err(Error::Codec(
-                "this file's audio is AAC, which isn't supported (AAC still requires a patent licence)".into(),
-            ));
+        if let Some(why) = unsupported_reason(params.codec) {
+            return Err(Error::Codec(format!("this file's sound is {why}")));
         }
         if params.codec == CODEC_ID_OPUS {
             // OpusHead: magic, version, channels, pre-skip (LE), rate, gain, mapping family.
@@ -63,7 +132,13 @@ impl PacketDecoder {
             if head.is_some_and(|h| h[18] != 0) || channels > 2 {
                 return Err(Error::Codec("surround Opus (more than 2 channels) is not supported yet".into()));
             }
-            let skip = head.map_or(0, |h| u16::from_le_bytes([h[10], h[11]]) as usize);
+            // Ogg/Matroska carry an OpusHead (version 1, little-endian). From MP4, symphonia
+            // passes the `dOps` box behind the same magic, but that box is version 0 and
+            // big-endian, so read the pre-skip accordingly.
+            let skip = head.map_or(0, |h| {
+                let b = [h[10], h[11]];
+                (if h[8] == 0 { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) }) as usize
+            });
             let decoder = OpusDecoder::new(48000, channels).map_err(|e| Error::Codec(format!("opus: {e}")))?;
             return Ok(Self::Opus { decoder: Box::new(decoder), channels, skip });
         }
@@ -108,18 +183,16 @@ fn sym_err(e: SymError) -> Error {
 }
 
 impl SymphoniaSource {
-    fn open(path: &Path, from: Format) -> Result<Self> {
-        let file = File::open(path).map_err(|source| Error::Io { path: path.into(), source })?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
-        let mut hint = Hint::new();
-        hint.with_extension(from.extension());
-
-        let mut format = symphonia::default::get_probe()
-            .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
-            .map_err(sym_err)?;
-        let track = format
-            .default_track(TrackType::Audio)
-            .ok_or_else(|| Error::Codec("no audio track found".into()))?;
+    /// `track` picks an audio track by position (`None` = the default one).
+    fn open(path: &Path, from: Format, track: Option<usize>) -> Result<Self> {
+        let mut format = probe(path, from)?;
+        let none = || {
+            Error::Codec(if from.kind() == dotty_core::Kind::Video { "this video has no sound".into() } else { "no audio track found".into() })
+        };
+        let track = match track {
+            Some(i) => *audio_tracks(format.as_ref()).get(i).ok_or_else(none)?,
+            None => format.default_track(TrackType::Audio).ok_or_else(none)?,
+        };
         let params = track
             .codec_params
             .as_ref()

@@ -955,3 +955,59 @@ fn loudness_normalizing_targets_the_layout_that_gets_written() {
     }
     assert_eq!((loudness[0].1, loudness[1].1, loudness[2].1), (2, 2, 1));
 }
+
+/// Upward zero crossings per second.
+fn pitch(samples: &[i32], rate: u32) -> f64 {
+    let ups = samples.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count();
+    ups as f64 * rate as f64 / samples.len() as f64
+}
+
+#[test]
+fn video_soundtracks_convert_like_audio_files() {
+    let dir = tmp("video-sound");
+    for (file, format) in [("video_opus.mp4", Format::Mp4), ("video_two_tracks.mkv", Format::Mkv), ("video_pcm.mov", Format::Mov)] {
+        let src = fixture(file);
+        assert_eq!(Format::detect(&src), Some(format), "{file}");
+        let dst = dir.join(format!("{file}.wav"));
+        run(&src, &dst, format, Format::Wav, &Options::default()).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let (info, samples, _) = read_all(&dst, Format::Wav, 16);
+        let secs = samples.len() as f64 / info.channels as f64 / info.sample_rate as f64;
+        assert!((secs - 0.5).abs() < 0.05, "{file}: {secs} s");
+        let p = pitch(&samples, info.sample_rate);
+        assert!((p - 440.0).abs() < 10.0, "{file}: the default (first) track's 440 Hz tone, got {p}");
+    }
+}
+
+#[test]
+fn a_second_audio_track_can_be_picked() {
+    let src = fixture("video_two_tracks.mkv");
+    let tracks = AudioConverter::default().tracks(&src, Format::Mkv);
+    assert_eq!(tracks.len(), 2);
+    assert!(tracks[0].default && !tracks[1].default && tracks.iter().all(|t| t.supported));
+    assert!(tracks[0].label.starts_with("Opus, mono"), "{}", tracks[0].label);
+
+    let edits = dotty_core::Edits {
+        ops: vec![dotty_core::EditOp::Audio(dotty_core::AudioEdits { track: Some(1), ..Default::default() })],
+    };
+    let dst = tmp("video-track").join("second.wav");
+    let cancel = AtomicBool::new(false);
+    let progress = |_: f32| {};
+    let options = Options::default();
+    let ctx = ConvertCtx::new(&options, &cancel, &progress).with_edits(Some(&edits));
+    AudioConverter::default().convert(&src, &dst, Format::Mkv, Format::Wav, &ctx).unwrap();
+    let (info, samples, _) = read_all(&dst, Format::Wav, 16);
+    let p = pitch(&samples, info.sample_rate);
+    assert!((p - 880.0).abs() < 15.0, "track 2 holds the 880 Hz tone, got {p}");
+}
+
+#[test]
+fn videos_without_usable_sound_say_why() {
+    let dir = tmp("video-nosound");
+    let err = |file: &str, f: Format| run(&fixture(file), &dir.join(format!("{file}.wav")), f, Format::Wav, &Options::default()).unwrap_err().to_string();
+    assert_eq!(Format::detect(&fixture("video_aac.mp4")), Some(Format::Mp4));
+    assert!(err("video_aac.mp4", Format::Mp4).contains("AAC"), "{}", err("video_aac.mp4", Format::Mp4));
+    assert_eq!(Format::detect(&fixture("video_silent.webm")), Some(Format::Webm));
+    assert_eq!(err("video_silent.webm", Format::Webm), "this video has no sound");
+    let tracks = AudioConverter::default().tracks(&fixture("video_aac.mp4"), Format::Mp4);
+    assert!(tracks.iter().all(|t| !t.supported && t.label.starts_with("AAC")), "{tracks:?}");
+}

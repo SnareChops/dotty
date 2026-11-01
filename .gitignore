@@ -1,3 +1,7 @@
 /target
 /testdata
 /dist
+/scripts
+**/*.md
+!README.md
+!LICENSE.md

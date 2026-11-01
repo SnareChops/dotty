@@ -82,6 +82,9 @@ pub enum EditOp {
 /// filters, fades, echo, reverb, volume. Fades come before the effects so echoes and reverb ring out naturally.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioEdits {
+    /// Which audio track of a file with several (in container order); `None` = the file's
+    /// default one.
+    pub track: Option<u32>,
     /// Keep from here (seconds into the source).
     pub trim_start: f64,
     /// Keep up to here (seconds into the source); `None` = to the end.
@@ -110,6 +113,7 @@ pub struct AudioEdits {
 impl Default for AudioEdits {
     fn default() -> Self {
         Self {
+            track: None,
             trim_start: 0.0,
             trim_end: None,
             reverse: false,
