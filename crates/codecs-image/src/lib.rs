@@ -293,11 +293,10 @@ fn write_file(img: &ImageData, dst: &Path, encoder: &dyn ImageEncoder, ctx: &Con
 
 /// One file per image in a new `name-frames` folder next to `dst`.
 fn write_frames(img: ImageData, from: Format, dst: &Path, encoder: &dyn ImageEncoder, ctx: &ConvertCtx) -> Result<()> {
-    let dir = output::frames_dir(dst);
-    std::fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
+    let dir = output::frames_dir(dst).map_err(|e| io_err(dst, e))?;
     let count = img.frames.len();
     let result = (|| {
-        let stem = dst.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
+        let stem = dst.file_stem().map_or_else(|| "frame".into(), |s| s.to_string_lossy());
         let ext = encoder.format().extension();
         let width = count.to_string().len().max(3);
         let mut first = None;

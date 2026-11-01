@@ -38,6 +38,9 @@ pub struct AudioEditor {
     title: String,
     state: State,
     cancel: Arc<AtomicBool>,
+    /// The output format's channel setting (`None` = keep), so normalizing measures the
+    /// layout that gets written.
+    output_channels: Option<u16>,
 }
 
 type Loaded = Result<(Arc<[f32]>, StreamInfo, Peaks), String>;
@@ -55,7 +58,14 @@ impl Drop for AudioEditor {
 }
 
 impl AudioEditor {
-    pub fn open(ctx: &egui::Context, entry: JobId, path: PathBuf, from: Format, existing: Option<Arc<Edits>>) -> Self {
+    pub fn open(
+        ctx: &egui::Context,
+        entry: JobId,
+        path: PathBuf,
+        from: Format,
+        existing: Option<Arc<Edits>>,
+        output_channels: Option<u16>,
+    ) -> Self {
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -69,14 +79,16 @@ impl AudioEditor {
             ctx.request_repaint();
         });
         let existing = existing.and_then(|e| e.audio().copied());
-        Self { entry, title, state: State::Loading(rx, existing), cancel }
+        Self { entry, title, state: State::Loading(rx, existing), cancel, output_channels }
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Outcome {
         if let State::Loading(rx, existing) = &mut self.state {
             match rx.try_recv() {
                 Ok(Ok((samples, info, peaks))) => {
-                    self.state = State::Ready(Box::new(Session::new(samples, info, peaks, existing.unwrap_or_default())))
+                    let mut session = Session::new(samples, info, peaks, existing.unwrap_or_default());
+                    session.output_channels = self.output_channels;
+                    self.state = State::Ready(Box::new(session))
                 }
                 Ok(Err(e)) => self.state = State::Failed(e),
                 Err(mpsc::TryRecvError::Disconnected) => self.state = State::Failed("couldn't open the file".into()),
@@ -197,6 +209,8 @@ struct Session {
     measuring: Option<Measuring>,
     /// Height the controls under the waveform took last frame (they wrap on narrow windows).
     controls_height: f32,
+    /// See [`AudioEditor::output_channels`].
+    output_channels: Option<u16>,
 }
 
 /// A measurement running in the background; dropping it cancels it.
@@ -239,6 +253,7 @@ impl Session {
             measured: None,
             measuring: None,
             controls_height: 180.0,
+            output_channels: None,
         };
         s.cursor = s.result_start();
         s
@@ -336,7 +351,7 @@ impl Session {
     fn volume(&self) -> (f32, bool) {
         let m = self.measurement();
         let g = volume_gain(self.edits.volume, m);
-        (g, limits(&self.edits, g, m))
+        (g, limits(&self.edits, self.info.channels, g, m))
     }
 
     /// Collect a finished measurement, and start one when the edits it depends on changed
@@ -361,8 +376,9 @@ impl Session {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let (samples, info, stop, ctx) = (self.samples.clone(), self.info.clone(), cancel.clone(), ctx.clone());
+        let output_channels = self.output_channels;
         std::thread::spawn(move || {
-            if let Ok(m) = measure_memory(samples, &info, &key, &stop) {
+            if let Ok(m) = measure_memory(samples, &info, &key, output_channels, &stop) {
                 let _ = tx.send(m);
                 ctx.request_repaint();
             }
@@ -1049,11 +1065,13 @@ impl Session {
     fn done(&mut self) -> Outcome {
         self.player.stop();
         let length = self.result_secs();
-        if self.edits.is_noop() {
+        // A channel setting that matches the source isn't an edit.
+        let edits = self.edits.without_noops(self.info.channels);
+        if edits.is_noop() {
             return Outcome::Done { edits: None, thumb: None, length };
         }
         let thumb = self.thumbnail();
-        Outcome::Done { edits: Some(Edits { ops: vec![EditOp::Audio(self.edits)] }), thumb: Some(thumb), length }
+        Outcome::Done { edits: Some(Edits { ops: vec![EditOp::Audio(edits)] }), thumb: Some(thumb), length }
     }
 
     /// The result's waveform, for the row.
@@ -1255,5 +1273,15 @@ mod tests {
         let Outcome::Done { length, thumb: Some(t), .. } = s.done() else { panic!("expected edits") };
         assert!((length - 1.0).abs() < 1e-9);
         assert_eq!(t.size, THUMB);
+    }
+
+    #[test]
+    fn picking_the_layout_a_file_already_has_is_not_an_edit() {
+        let mut s = session(5);
+        s.edits.channels = Channels::Stereo { width: 0.0 };
+        assert!(matches!(s.done(), Outcome::Done { edits: None, .. }), "the test file is already stereo");
+        s.edits.channels = Channels::Mono;
+        let Outcome::Done { edits: Some(e), .. } = s.done() else { panic!("mono is a change") };
+        assert_eq!(e.audio().unwrap().channels, Channels::Mono);
     }
 }

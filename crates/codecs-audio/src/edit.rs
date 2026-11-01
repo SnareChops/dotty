@@ -122,27 +122,42 @@ pub fn volume_gain(volume: Volume, measured: Option<&Measurement>) -> f32 {
 
 /// Whether the limiter is armed for `gain`. Normalizing has a measurement, so it's armed only
 /// when the peak would pass [`CEILING`]. A plain gain change isn't measured (the converter
-/// reads the file once), so it's armed for any boost and for edits that can raise peaks
-/// (effects, widening). Armed or not, it changes nothing below the ceiling; the decision
-/// only depends on what both the converter and the editor know, so they always agree.
-pub fn limits(edits: &AudioEdits, gain: f32, measured: Option<&Measurement>) -> bool {
+/// reads the file once), so it's armed for any boost and for edits that can raise peaks.
+/// Armed or not, it changes nothing below the ceiling; the decision only depends on what both
+/// the converter and the editor know, so they always agree.
+pub fn limits(edits: &AudioEdits, source_channels: u16, gain: f32, measured: Option<&Measurement>) -> bool {
     if edits.volume.measures() {
         measured.is_none_or(|m| m.peak * gain > CEILING)
     } else {
-        gain > 1.0 || raises_peaks(edits)
+        gain > 1.0 || raises_peaks(edits, source_channels)
     }
 }
 
-/// Edits that can push peaks above where the source had them.
-fn raises_peaks(edits: &AudioEdits) -> bool {
-    edits.echo.is_some() || edits.reverb.is_some() || matches!(edits.channels, Channels::Stereo { width } if width > 0.0)
+/// Edits that can push peaks above where the source had them: effects add sound, filters
+/// overshoot on sharp edges, resampling and overlap-adding ring, widening adds a copy.
+fn raises_peaks(edits: &AudioEdits, source_channels: u16) -> bool {
+    edits.echo.is_some()
+        || edits.reverb.is_some()
+        || edits.low_cut.is_some()
+        || edits.high_cut.is_some()
+        || edits.speed != 1.0
+        || edits.pitch != 0.0
+        || matches!(edits.channels, Channels::Stereo { width } if width > 0.0 && source_channels == 1)
+}
+
+/// Channels after the editor's channel setting, for a source with `source` channels.
+pub fn edited_channels(edits: &AudioEdits, source: u16) -> u16 {
+    match edits.channels {
+        Channels::Keep => source,
+        Channels::Mono => 1,
+        Channels::Stereo { .. } => 2,
+    }
 }
 
 /// Every stage before the volume: trim, reverse, filters, fades, effects. Measure this to
 /// normalize.
 pub fn shape<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Result<Box<dyn AudioSource + 'a>> {
-    let info = src.info();
-    let plan = Plan::new(edits, info.sample_rate, info.total_frames);
+    let plan = stream_plan(edits, src.info().sample_rate);
     let mut src = src;
     if plan.start > 0 || plan.end.is_some() {
         src = Box::new(Trim::new(src, plan.start, plan.end));
@@ -186,16 +201,42 @@ fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Pla
 }
 
 /// The volume stage.
-fn with_volume<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured: Option<&Measurement>) -> Box<dyn AudioSource + 'a> {
+fn with_volume<'a>(
+    src: Box<dyn AudioSource + 'a>,
+    edits: &AudioEdits,
+    source_channels: u16,
+    measured: Option<&Measurement>,
+) -> Box<dyn AudioSource + 'a> {
     let gain = volume_gain(edits.volume, measured);
-    let limit = limits(edits, gain, measured);
+    let limit = limits(edits, source_channels, gain, measured);
     if gain != 1.0 || limit { Box::new(Gain::new(src, gain, limit)) } else { src }
 }
 
-/// Applies `edits` to a stream starting at its first frame (the converter's case).
-/// `measured` is [`measure`] of [`shape`] of the same stream, needed when normalizing.
+/// [`shape`], then mixed to the output's `channels`. Loudness depends on the layout (the
+/// same sound on two speakers measures 3 LU louder than on one), so normalizing measures
+/// this: the layout that gets written.
+pub fn shape_to<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, channels: u16) -> Result<Box<dyn AudioSource + 'a>> {
+    let src = shape(src, edits)?;
+    Ok(if src.info().channels != channels { Box::new(Remix::new(src, channels.clamp(1, 2))) } else { src })
+}
+
+/// Applies `edits` to a stream starting at its first frame (the converter's case), writing
+/// `channels` channels. `measured` is [`measure`] of [`shape_to`] of the same stream, needed
+/// when normalizing.
+pub fn apply_to<'a>(
+    src: Box<dyn AudioSource + 'a>,
+    edits: &AudioEdits,
+    measured: Option<&Measurement>,
+    channels: u16,
+) -> Result<Box<dyn AudioSource + 'a>> {
+    let source = src.info().channels;
+    Ok(with_volume(shape_to(src, edits, channels)?, edits, source, measured))
+}
+
+/// [`apply_to`] keeping the layout the edits give.
 pub fn apply<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured: Option<&Measurement>) -> Result<Box<dyn AudioSource + 'a>> {
-    Ok(with_volume(shape(src, edits)?, edits, measured))
+    let channels = edited_channels(edits, src.info().channels);
+    apply_to(src, edits, measured, channels)
 }
 
 /// Reads `src` to the end and measures it. Stops early if `cancel` is set.
@@ -219,6 +260,13 @@ pub fn measure(mut src: Box<dyn AudioSource + '_>, cancel: Option<&AtomicBool>) 
     Ok(Measurement { peak, loudness })
 }
 
+/// The plan for a stream read from a decoder. Its length isn't passed on: for some formats
+/// (MP3 without a Xing header, for one) it's only an estimate, and trimming to an estimate
+/// that's short would cut off the end. Only an explicit trim end stops the stream early.
+pub fn stream_plan(edits: &AudioEdits, rate: u32) -> Plan {
+    Plan::new(edits, rate, None)
+}
+
 /// Keeps source frames `start..end` and drops the rest.
 pub struct Trim<S> {
     inner: S,
@@ -230,13 +278,11 @@ pub struct Trim<S> {
 }
 
 impl<S: AudioSource> Trim<S> {
+    /// Stops at `end` if given, otherwise at the end of the stream (whatever its declared length).
     pub fn new(inner: S, start: u64, end: Option<u64>) -> Self {
         let mut info = inner.info().clone();
-        let end = match (end, info.total_frames) {
-            (Some(e), Some(t)) => Some(e.min(t)),
-            (e, t) => e.or(t),
-        };
-        info.total_frames = end.map(|e| e.saturating_sub(start));
+        // Only a length hint from here on.
+        info.total_frames = end.or(info.total_frames).map(|e| e.saturating_sub(start));
         Self { inner, info, start, end, pos: 0, buf: Vec::new() }
     }
 }
@@ -474,6 +520,14 @@ struct Biquad {
 }
 
 impl Biquad {
+    /// One sample through the filter (transposed direct form II); `z` is its state.
+    fn process(&self, x: f64, z: &mut [f64; 2]) -> f64 {
+        let y = self.b0 * x + z[0];
+        z[0] = self.b1 * x - self.a1 * y + z[1];
+        z[1] = self.b2 * x - self.a2 * y;
+        y
+    }
+
     fn new(freq: f32, rate: u32, high_pass: bool) -> Self {
         let w0 = 2.0 * std::f64::consts::PI * freq as f64 / rate as f64;
         let (sin, cos) = w0.sin_cos();
@@ -529,12 +583,7 @@ impl<S: AudioSource> AudioSource for Filters<S> {
             for (c, s) in frame.iter_mut().enumerate() {
                 let mut x = *s as f64;
                 for (k, q) in self.biquads.iter().enumerate() {
-                    // Transposed direct form II.
-                    let z = &mut self.state[k * ch + c];
-                    let y = q.b0 * x + z[0];
-                    z[0] = q.b1 * x - q.a1 * y + z[1];
-                    z[1] = q.b2 * x - q.a2 * y;
-                    x = y;
+                    x = q.process(x, &mut self.state[k * ch + c]);
                 }
                 *s = x as f32;
             }
@@ -554,6 +603,8 @@ struct Gain<S> {
     inner: S,
     gain: f32,
     limiter: Option<Limiter>,
+    /// One frame after the gain, on its way into the limiter.
+    frame: Vec<f32>,
     out: Vec<f32>,
     done: bool,
 }
@@ -562,7 +613,8 @@ impl<S: AudioSource> Gain<S> {
     fn new(inner: S, gain: f32, limit: bool) -> Self {
         let info = inner.info();
         let limiter = limit.then(|| Limiter::new(info.channels as usize, info.sample_rate));
-        Self { inner, gain, limiter, out: Vec::new(), done: false }
+        let frame = vec![0.0; info.channels.max(1) as usize];
+        Self { inner, gain, limiter, frame, out: Vec::new(), done: false }
     }
 }
 
@@ -581,10 +633,9 @@ impl<S: AudioSource> AudioSource for Gain<S> {
                 Some(chunk) => match &mut self.limiter {
                     None => self.out.extend(chunk.iter().map(|s| s * self.gain)),
                     Some(l) => {
-                        let mut frame = vec![0.0; ch];
                         for f in chunk.chunks_exact(ch) {
-                            frame.iter_mut().zip(f).for_each(|(o, s)| *o = s * self.gain);
-                            l.push(Some(&frame), &mut self.out);
+                            self.frame.iter_mut().zip(f).for_each(|(o, s)| *o = s * self.gain);
+                            l.push(Some(&self.frame), &mut self.out);
                         }
                     }
                 },
@@ -697,7 +748,7 @@ pub fn preview<'a>(
     } else {
         Box::new(MemorySource::new(samples, info, from, Some(end)))
     };
-    let mut chain = with_volume(after_pick(src, edits, &plan, plan.output_index(from, end))?, edits, measured);
+    let mut chain = with_volume(after_pick(src, edits, &plan, plan.output_index(from, end))?, edits, info.channels, measured);
     if channels != chain.info().channels {
         chain = Box::new(Remix::new(chain, channels.clamp(1, 2)));
     }
@@ -957,15 +1008,10 @@ impl<S: AudioSource> AudioSource for Widen<S> {
     fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
         let Some(chunk) = self.inner.next_chunk()? else { return Ok(None) };
         self.buf.clear();
-        let q = self.high_pass;
         for &x in chunk {
             let delayed = std::mem::replace(&mut self.delay[self.pos], x);
             self.pos = (self.pos + 1) % self.delay.len();
-            let z = &mut self.state;
-            let y = q.b0 * delayed as f64 + z[0];
-            z[0] = q.b1 * delayed as f64 - q.a1 * y + z[1];
-            z[1] = q.b2 * delayed as f64 - q.a2 * y;
-            let side = self.amount * y as f32;
+            let side = self.amount * self.high_pass.process(delayed as f64, &mut self.state) as f32;
             self.buf.extend([x + side, x - side]);
         }
         Ok(Some(&self.buf))
@@ -1223,9 +1269,17 @@ impl<S: AudioSource> AudioSource for Effects<S> {
     }
 }
 
-/// Measures the editor's in-memory copy as the volume stage will see it.
-pub fn measure_memory(samples: Arc<[f32]>, info: &StreamInfo, edits: &AudioEdits, cancel: &AtomicBool) -> Result<Measurement> {
-    measure(shape(Box::new(MemorySource::new(samples, info, 0, None)), edits)?, Some(cancel))
+/// Measures the editor's in-memory copy as the volume stage will see it, mixed to the
+/// output format's channel setting if it has one (`None` = keep the edited layout).
+pub fn measure_memory(
+    samples: Arc<[f32]>,
+    info: &StreamInfo,
+    edits: &AudioEdits,
+    output_channels: Option<u16>,
+    cancel: &AtomicBool,
+) -> Result<Measurement> {
+    let channels = output_channels.unwrap_or_else(|| edited_channels(edits, info.channels));
+    measure(shape_to(Box::new(MemorySource::new(samples, info, 0, None)), edits, channels)?, Some(cancel))
 }
 
 /// Decode a whole file into memory for the editor. Fails if it's longer than `max_secs`.
@@ -1329,7 +1383,7 @@ mod tests {
         let i = info_at(rate, 1, samples.len());
         let samples: Arc<[f32]> = samples.into();
         let cancel = AtomicBool::new(false);
-        let m = edits.volume.measures().then(|| measure_memory(samples.clone(), &i, edits, &cancel).unwrap());
+        let m = edits.volume.measures().then(|| measure_memory(samples.clone(), &i, edits, None, &cancel).unwrap());
         drain(apply(Box::new(MemorySource::new(samples, &i, 0, None)), edits, m.as_ref()).unwrap())
     }
 
@@ -1582,8 +1636,32 @@ mod tests {
             AudioEdits { volume: Volume::Gain(-3.0), ..Default::default() },
         ] {
             let g = volume_gain(e.volume, None);
-            assert_eq!(limits(&e, g, None), limits(&e, g, Some(&m)), "{e:?}");
+            assert_eq!(limits(&e, 1, g, None), limits(&e, 1, g, Some(&m)), "{e:?}");
         }
-        assert!(!limits(&AudioEdits::default(), 1.0, None), "untouched audio is never limited");
+        assert!(!limits(&AudioEdits::default(), 2, 1.0, None), "untouched audio is never limited");
+        // Filters and speed/pitch can overshoot, so they arm it too.
+        for e in [
+            AudioEdits { low_cut: Some(200.0), ..Default::default() },
+            AudioEdits { speed: 1.5, ..Default::default() },
+            AudioEdits { pitch: -2.0, ..Default::default() },
+        ] {
+            assert!(limits(&e, 2, 1.0, None), "{e:?}");
+        }
+        // Widening only happens to mono sources.
+        let wide = AudioEdits { channels: Channels::Stereo { width: 0.8 }, ..Default::default() };
+        assert!(limits(&wide, 1, 1.0, None) && !limits(&wide, 2, 1.0, None));
+    }
+
+    #[test]
+    fn a_short_length_estimate_does_not_cut_the_end_off() {
+        // A decoder that underestimates its length, like an MP3 without a Xing header.
+        let samples = ramp(1, 5000);
+        let mut i = info(1, 5000);
+        i.total_frames = Some(4000);
+        let src = MemorySource { info: i.clone(), ..MemorySource::new(samples, &info(1, 5000), 0, None) };
+        let e = AudioEdits { trim_start: 1.0, ..Default::default() };
+        let out = drain(apply(Box::new(src), &e, None).unwrap());
+        assert_eq!(out.len(), 4000, "kept from 1 s to the real end at 5 s");
+        assert_eq!(out[out.len() - 1], 4999.0);
     }
 }

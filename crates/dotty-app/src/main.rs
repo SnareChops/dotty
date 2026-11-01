@@ -9,7 +9,7 @@ use audio_editor::AudioEditor;
 use editor::{Editor, Outcome};
 use eframe::egui;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use dotty_core::{
     Choice, Edits, Format, JobEvent, JobId, JobRequest, JobRunner, Kind, Options, Preset, Registry,
 };
@@ -92,7 +92,14 @@ struct App {
     editor: Option<ActiveEditor>,
     /// Shows transparency behind edited images.
     checker: egui::TextureHandle,
+    /// Whether each newly added file holds several images, found on a background thread
+    /// (it means decoding a little of each file, which would stall the window for big drops).
+    probes: (mpsc::Sender<Probe>, mpsc::Receiver<Probe>),
+    ctx: egui::Context,
 }
+
+/// A file found to hold several images.
+type Probe = (JobId, bool);
 
 enum ActiveEditor {
     Image(Editor),
@@ -133,12 +140,15 @@ impl App {
         // run one job per core.
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
         let checker = editor::checker_texture(&ctx);
-        let runner = JobRunner::new(registry.clone(), (cores / 2).clamp(1, 8), move || ctx.request_repaint());
-        Self { registry, runner, entries: Vec::new(), next_id: 0, options, notice: None, editor: None, checker }
+        let wake = ctx.clone();
+        let runner = JobRunner::new(registry.clone(), (cores / 2).clamp(1, 8), move || wake.request_repaint());
+        let probes = mpsc::channel();
+        Self { registry, runner, entries: Vec::new(), next_id: 0, options, notice: None, editor: None, checker, probes, ctx }
     }
 
     fn add_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         let mut skipped = 0;
+        let mut probe = Vec::new();
         for path in paths {
             if self.entries.iter().any(|e| e.path == path) {
                 continue;
@@ -148,14 +158,32 @@ impl App {
                 continue;
             };
             let to = self.registry.targets(from).into_iter().next();
-            let multi = self.registry.multi_image(&path, from);
             self.next_id += 1;
-            self.entries.push(Entry { id: self.next_id, path, from, multi, to, status: Status::Ready, edits: None, preview: None, edited_length: None });
+            if from.multi_image_input() {
+                probe.push((self.next_id, path.clone(), from));
+            }
+            self.entries.push(Entry { id: self.next_id, path, from, multi: false, to, status: Status::Ready, edits: None, preview: None, edited_length: None });
+        }
+        if !probe.is_empty() {
+            let (registry, tx, ctx) = (self.registry.clone(), self.probes.0.clone(), self.ctx.clone());
+            std::thread::spawn(move || {
+                for (id, path, from) in probe {
+                    if registry.multi_image(&path, from) && tx.send((id, true)).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            });
         }
         self.notice = (skipped > 0).then(|| format!("{skipped} file(s) skipped: unsupported type"));
     }
 
     fn pump_events(&mut self) {
+        while let Ok((id, multi)) = self.probes.1.try_recv() {
+            if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                e.multi = multi;
+            }
+        }
         while let Ok(ev) = self.runner.events().try_recv() {
             let (id, status) = match ev {
                 JobEvent::Started(id) => (id, Status::Running(0.0)),
@@ -204,7 +232,15 @@ impl App {
     fn open_editor(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.entries[i];
         self.editor = Some(match e.from.kind() {
-            Kind::Audio => ActiveEditor::Audio(AudioEditor::open(ctx, e.id, e.path.clone(), e.from, e.edits.clone())),
+            Kind::Audio => {
+                // Normalizing in the editor measures the layout the target will be written in.
+                let output_channels = e.to.and_then(|to| match self.options.choice(to, &codecs_audio::CHANNELS) {
+                    "mono" => Some(1),
+                    "stereo" => Some(2),
+                    _ => None,
+                });
+                ActiveEditor::Audio(AudioEditor::open(ctx, e.id, e.path.clone(), e.from, e.edits.clone(), output_channels))
+            }
             _ => ActiveEditor::Image(Editor::open(ctx, e.id, e.path.clone(), e.from, self.options.clone(), e.edits.clone())),
         });
     }
@@ -898,5 +934,31 @@ mod tests {
     fn image_size(path: &std::path::Path) -> (u32, u32) {
         let (_, size) = codecs_image::edit::decode_for_edit(path, Format::Png, &Options::default(), u32::MAX, u64::MAX).unwrap();
         size
+    }
+
+    #[test]
+    fn animated_files_are_found_in_the_background() {
+        let dir = std::env::temp_dir().join(format!("tf-app-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A 1x1 GIF with two frames.
+        let frame: &[u8] = &[0x21, 0xF9, 4, 0, 10, 0, 0, 0, 0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 1, 0];
+        let mut gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff".to_vec();
+        gif.extend_from_slice(b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00");
+        gif.extend_from_slice(frame);
+        gif.extend_from_slice(frame);
+        gif.push(0x3B);
+        let path = dir.join("anim.gif");
+        std::fs::write(&path, &gif).unwrap();
+
+        let mut app = app();
+        app.add_files([path]);
+        assert_eq!(app.entries.len(), 1, "added straight away, before the probe finishes");
+        let start = Instant::now();
+        while !app.entries[0].multi && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+            app.pump_events();
+        }
+        assert!(app.entries[0].multi, "the probe found both frames");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

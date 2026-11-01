@@ -4,7 +4,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
 pub type JobId = u64;
@@ -33,23 +33,23 @@ pub enum JobEvent {
 /// Runs jobs on a fixed worker pool. Events are delivered on `events()`;
 /// `wake` is called after each event so a UI can request a repaint.
 pub struct JobRunner {
-    tx: Sender<JobRequest>,
+    tx: Sender<(JobRequest, Arc<AtomicBool>)>,
     events: Receiver<JobEvent>,
-    cancel: Arc<AtomicBool>,
+    /// The cancel flag of every job queued or running. Each job has its own, so cancelling
+    /// can't be undone by submitting new work while cancelled jobs are still in the queue.
+    live: Mutex<Vec<Weak<AtomicBool>>>,
 }
 
 impl JobRunner {
     pub fn new(registry: Arc<Registry>, workers: usize, wake: impl Fn() + Send + Sync + 'static) -> Self {
-        let (tx, rx) = unbounded::<JobRequest>();
+        let (tx, rx) = unbounded::<(JobRequest, Arc<AtomicBool>)>();
         let (etx, events) = unbounded();
-        let cancel = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(wake);
 
         for _ in 0..workers.max(1) {
-            let (rx, etx, registry, cancel, wake) =
-                (rx.clone(), etx.clone(), registry.clone(), cancel.clone(), wake.clone());
+            let (rx, etx, registry, wake) = (rx.clone(), etx.clone(), registry.clone(), wake.clone());
             thread::spawn(move || {
-                for job in rx {
+                for (job, cancel) in rx {
                     let send = |e: JobEvent| {
                         let _ = etx.send(e);
                         wake();
@@ -70,17 +70,24 @@ impl JobRunner {
                 }
             });
         }
-        Self { tx, events, cancel }
+        Self { tx, events, live: Mutex::new(Vec::new()) }
     }
 
     pub fn submit(&self, job: JobRequest) {
-        self.cancel.store(false, Ordering::Relaxed);
-        let _ = self.tx.send(job);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.retain(|w| w.strong_count() > 0); // finished jobs dropped theirs
+        live.push(Arc::downgrade(&cancel));
+        let _ = self.tx.send((job, cancel));
     }
 
-    /// Cancel all running and queued jobs.
+    /// Cancel all running and queued jobs (not ones submitted afterwards).
     pub fn cancel_all(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        for flag in self.live.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            if let Some(flag) = flag.upgrade() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn events(&self) -> &Receiver<JobEvent> {
@@ -97,14 +104,23 @@ fn run_job(
     let converter = registry
         .find(job.from, job.to)
         .ok_or(Error::NoRoute { from: job.from, to: job.to })?;
-    let dst = output::output_path(&job.src, job.to, &job.options);
+    // Claims the name (as an empty file) so parallel jobs can't write to the same one.
+    let dst = output::output_path(&job.src, job.to, &job.options).map_err(|source| Error::Io { path: job.src.clone(), source })?;
     let progress = |p: f32| send(JobEvent::Progress(job.id, p));
     let ctx = ConvertCtx::new(&job.options, cancel, &progress).with_edits(job.edits.as_deref());
     if let Err(e) = converter.convert(&job.src, &dst, job.from, job.to, &ctx) {
-        let _ = std::fs::remove_file(&dst); // don't leave partial output
+        // Ours alone (claimed above), so removing it can't touch another job's output.
+        let _ = std::fs::remove_file(&dst);
         return Err(e);
     }
-    Ok((ctx.take_output().unwrap_or(dst), ctx.take_notes()))
+    match ctx.take_output() {
+        // The result went elsewhere (one file per frame): drop the claimed, unused name.
+        Some(other) if other != dst => {
+            let _ = std::fs::remove_file(&dst);
+            Ok((other, ctx.take_notes()))
+        }
+        _ => Ok((dst, ctx.take_notes())),
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +173,51 @@ mod tests {
                 _ => {}
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Waits (up to 5 s) for its job to be cancelled.
+    struct Slow;
+    impl Converter for Slow {
+        fn routes(&self) -> Vec<(Format, Format)> {
+            vec![(Format::Png, Format::Gif)]
+        }
+        fn convert(&self, _: &Path, dst: &Path, _: Format, _: Format, ctx: &ConvertCtx) -> crate::Result<()> {
+            for _ in 0..500 {
+                ctx.check_cancelled()?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::write(dst, b"slow").map_err(|source| Error::Io { path: dst.into(), source })
+        }
+    }
+
+    #[test]
+    fn cancelling_sticks_when_new_work_is_submitted() {
+        let dir = std::env::temp_dir().join(format!("tf-jobs-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.png");
+        std::fs::write(&src, b"x").unwrap();
+        let mut reg = Registry::new();
+        reg.register(Box::new(Slow));
+        reg.register(Box::new(Copy));
+        let runner = JobRunner::new(Arc::new(reg), 1, || {});
+        let mk = |id, to| JobRequest { id, src: src.clone(), from: Format::Png, to, options: Options::default(), edits: None };
+        runner.submit(mk(1, Format::Gif)); // running
+        runner.submit(mk(2, Format::Gif)); // queued behind it
+        assert!(matches!(runner.events().recv_timeout(Duration::from_secs(5)).unwrap(), JobEvent::Started(1)));
+        runner.cancel_all();
+        runner.submit(mk(3, Format::Jpeg)); // new work after cancelling
+        let mut seen = std::collections::HashMap::new();
+        while seen.len() < 3 {
+            match runner.events().recv_timeout(Duration::from_secs(5)).unwrap() {
+                JobEvent::Cancelled(id) => drop(seen.insert(id, "cancelled")),
+                JobEvent::Done(id, ..) => drop(seen.insert(id, "done")),
+                JobEvent::Failed(id, m) => panic!("job {id} failed: {m}"),
+                _ => {}
+            }
+        }
+        assert_eq!((seen[&1], seen[&2], seen[&3]), ("cancelled", "cancelled", "done"));
+        assert!(!dir.join("a.gif").exists() && !dir.join("a (1).gif").exists(), "cancelled jobs leave nothing behind");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

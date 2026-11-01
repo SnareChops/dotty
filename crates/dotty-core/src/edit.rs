@@ -202,6 +202,20 @@ impl AudioEdits {
     pub const MIN_SPEED: f64 = 0.15;
     pub const MAX_SPEED: f64 = 4.0;
 
+    /// These edits with settings that change nothing for a source with `channels` channels
+    /// reset to their defaults (e.g. "Stereo" on a stereo file), so they don't count as edits.
+    pub fn without_noops(mut self, channels: u16) -> Self {
+        let same = match self.channels {
+            Channels::Keep => true,
+            Channels::Mono => channels == 1,
+            Channels::Stereo { .. } => channels == 2,
+        };
+        if same {
+            self.channels = Channels::Keep;
+        }
+        self
+    }
+
     /// Whether these change nothing.
     pub fn is_noop(&self) -> bool {
         *self == Self::default()
@@ -348,5 +362,14 @@ mod tests {
         assert_eq!(r.scaled(1, 1), (0, 0, 1, 1));
         let edge = Region { x: 99, y: 99, width: 1, height: 1, of_width: 100, of_height: 100 };
         assert_eq!(edge.scaled(10, 10), (9, 9, 1, 1));
+    }
+
+    #[test]
+    fn channel_settings_that_match_the_source_are_not_edits() {
+        let stereo = AudioEdits { channels: Channels::Stereo { width: 0.5 }, ..Default::default() };
+        assert!(stereo.without_noops(2).is_noop());
+        assert!(!stereo.without_noops(1).is_noop(), "mono to stereo is a real change");
+        let mono = AudioEdits { channels: Channels::Mono, ..Default::default() };
+        assert!(mono.without_noops(1).is_noop() && !mono.without_noops(2).is_noop());
     }
 }

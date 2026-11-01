@@ -235,8 +235,24 @@ impl Converter for AudioConverter {
         let file = File::create(dst).map_err(|source| Error::Io { path: dst.into(), source })?;
         let mut out = BufWriter::new(file);
         {
-            let audio_edits = ctx.edits.and_then(|e| e.audio()).filter(|a| !a.is_noop());
-            let plan = audio_edits.map(|a| edit::Plan::new(a, info.sample_rate, info.total_frames));
+            let audio_edits = ctx.edits.and_then(|e| e.audio()).map(|a| a.without_noops(info.channels)).filter(|a| !a.is_noop());
+            let audio_edits = audio_edits.as_ref();
+            // The layout written: what the edits give, then the output format's setting.
+            let have = audio_edits.map_or(info.channels, |a| edit::edited_channels(a, info.channels));
+            let wanted = match ctx.options.choice(to, &CHANNELS) {
+                "mono" => 1,
+                "stereo" => 2,
+                _ => have,
+            };
+            let mut channels = wanted.min(encoder.max_channels());
+            if channels != have {
+                channels = channels.min(2);
+                if channels != wanted {
+                    let layout = if channels == 1 { "mono" } else { "stereo" };
+                    ctx.note(format!("{have}-channel audio was mixed down to {layout}"));
+                }
+            }
+            let plan = audio_edits.map(|a| edit::stream_plan(a, info.sample_rate));
             let until = plan.and_then(|p| p.end);
             // Normalizing reads the file twice: once to measure, once to write.
             let measuring = audio_edits.is_some_and(|a| a.volume.measures());
@@ -246,30 +262,17 @@ impl Converter for AudioConverter {
                 Some(a) if measuring => {
                     let mut again = self.open(src, from)?;
                     let metered = Metered::new(&mut again, ctx, pass1).until(until);
-                    Some(edit::measure(edit::shape(Box::new(metered), a)?, None)?)
+                    Some(edit::measure(edit::shape_to(Box::new(metered), a, channels)?, None)?)
                 }
                 _ => None,
             };
             let metered = Metered::new(&mut decoded, ctx, pass2).offset(pass1).until(until);
             let mut chain: Box<dyn AudioSource + '_> = Box::new(metered);
-            if let Some(a) = audio_edits {
-                chain = edit::apply(chain, a, measured.as_ref())?;
-            }
-            // Edits may have changed the layout (the editor's channel setting).
-            let have = chain.info().channels;
-            let wanted = match ctx.options.choice(to, &CHANNELS) {
-                "mono" => 1,
-                "stereo" => 2,
-                _ => have,
-            };
-            let channels = wanted.min(encoder.max_channels());
-            if channels != have {
-                let channels = channels.min(2);
-                if channels != wanted {
-                    let layout = if channels == 1 { "mono" } else { "stereo" };
-                    ctx.note(format!("{have}-channel audio was mixed down to {layout}"));
-                }
-                chain = Box::new(Remix::new(chain, channels));
+            match audio_edits {
+                // Mixed to the output layout before the volume, as it was measured.
+                Some(a) => chain = edit::apply_to(chain, a, measured.as_ref(), channels)?,
+                None if channels != have => chain = Box::new(Remix::new(chain, channels)),
+                None => {}
             }
             let wanted = match ctx.options.choice(to, &SAMPLE_RATE) {
                 "keep" => info.sample_rate,

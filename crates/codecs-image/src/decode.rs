@@ -243,12 +243,18 @@ fn tiff_to_image(w: u32, h: u32, color: tiff::ColorType, pixels: tiff::decoder::
         (C::RGBA(16), D::U16(v)) => ImageRgba16(ImageBuffer::from_raw(w, h, v)?),
         (C::RGB(32), D::F32(v)) => ImageRgb32F(ImageBuffer::from_raw(w, h, v)?),
         (C::RGBA(32), D::F32(v)) => ImageRgba32F(ImageBuffer::from_raw(w, h, v)?),
-        (C::CMYK(8), D::U8(v)) => ImageRgb8(ImageBuffer::from_fn(w, h, |x, y| {
-            let i = (y * w + x) as usize * 4;
-            let k = 255 - v.get(i + 3).copied().unwrap_or(0) as u32;
-            let ch = |c: u8| ((255 - c as u32) * k / 255) as u8;
-            image::Rgb([ch(v[i]), ch(v[i + 1]), ch(v[i + 2])])
-        })),
+        (C::CMYK(8), D::U8(v)) => {
+            // A page shorter than its declared size is skipped like any other unreadable one.
+            if v.len() < w as usize * h as usize * 4 {
+                return None;
+            }
+            ImageRgb8(ImageBuffer::from_fn(w, h, |x, y| {
+                let i = (y as usize * w as usize + x as usize) * 4;
+                let k = 255 - v[i + 3] as u32;
+                let ch = |c: u8| ((255 - c as u32) * k / 255) as u8;
+                image::Rgb([ch(v[i]), ch(v[i + 1]), ch(v[i + 2])])
+            }))
+        }
         _ => return None,
     })
 }

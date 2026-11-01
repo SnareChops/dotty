@@ -1678,11 +1678,14 @@ mod tests {
         let mut c = canvas(100, 50);
         let frame = |c: &mut Canvas, time: f64, change: &dyn Fn(&mut Canvas)| {
             let input = egui::RawInput { time: Some(time), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            let mut output = ctx.run_ui(input, |ui| {
                 let before = c.captions.clone();
                 change(c);
                 c.record_caption_changes(ui, before);
             });
+            // No renderer takes the texture updates (the font atlas on the first frame), and
+            // egui panics in debug builds if they're dropped unapplied.
+            output.textures_delta.clear();
         };
         frame(&mut c, 0.0, &|c| c.add_caption(egui::pos2(10.0, 10.0)));
         frame(&mut c, 0.3, &|c| c.captions[0].text.push('A'));
