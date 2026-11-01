@@ -1,0 +1,18 @@
+[package]
+name = "codecs-image"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff", "ico", "webp", "avif", "tga", "qoi", "pnm", "hdr", "exr", "dds"] }
+jxl-oxide = { version = "0.12.6", default-features = false }
+oxideav-avif = "0.0.16"
+png = "0.18.1"
+resvg = "0.49.0"
+rusty_webp = "0.1.3"
+tiff = "0.11.3"
+zune-core = "0.5.3"
+zune-jpegxl = "0.5.2"
+tola-webp = "0.8.1"
+transformer-core = { version = "0.1.0", path = "../transformer-core" }

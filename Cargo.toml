@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/codecs-image", "crates/codecs-audio", "crates/transformer-core", "crates/transformer-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Codec dependencies are far too slow unoptimised; keep them fast in dev/test builds.
+[profile.dev.package.oxideav-vorbis]
+opt-level = 3
+[profile.dev.package.rusty_mp3]
+opt-level = 3
+[profile.dev.package.flacenc]
+opt-level = 3
+[profile.dev.package.rubato]
+opt-level = 3
+[profile.dev.package.rav1e]
+opt-level = 3
+[profile.dev.package.oxideav-av1]
+opt-level = 3
+[profile.dev.package.jxl-oxide]
+opt-level = 3
+[profile.dev.package.resvg]
+opt-level = 3

@@ -1,0 +1,15 @@
+[package]
+name = "codecs-audio"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+flacenc = "0.5.1"
+opus-pure = "0.2.2"
+oxideav-vorbis = "=0.0.12"
+rubato = "5.0.1"
+rusty_mp3 = "1.0.5"
+# No "aac": AAC still requires a patent licence.
+symphonia = { version = "0.6.1", default-features = false, features = ["mpa", "flac", "vorbis", "alac", "adpcm", "pcm", "wav", "aiff", "caf", "isomp4", "mkv", "ogg", "all-meta"] }
+transformer-core = { version = "0.1.0", path = "../transformer-core" }
