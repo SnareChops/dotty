@@ -78,7 +78,8 @@ pub enum EditOp {
 }
 
 /// Changes to an audio file. Unlike image edits these are a fixed set of knobs: the
-/// pipeline turns them into stages in a set order (trim, reverse, filters, volume, fades).
+/// pipeline turns them into stages in a set order: trim, reverse, filters, fades, echo,
+/// reverb, volume. Fades come before the effects so echoes and reverb ring out naturally.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioEdits {
     /// Keep from here (seconds into the source).
@@ -91,6 +92,8 @@ pub struct AudioEdits {
     pub low_cut: Option<f32>,
     /// Remove what's above this many Hz (hiss), 12 dB/octave.
     pub high_cut: Option<f32>,
+    pub echo: Option<Echo>,
+    pub reverb: Option<Reverb>,
     pub volume: Volume,
     /// Fade-in and fade-out lengths in seconds of output.
     pub fade_in: f64,
@@ -105,10 +108,52 @@ impl Default for AudioEdits {
             reverse: false,
             low_cut: None,
             high_cut: None,
+            echo: None,
+            reverb: None,
             volume: Volume::Gain(0.0),
             fade_in: 0.0,
             fade_out: 0.0,
         }
+    }
+}
+
+/// Repeats of the sound, each quieter than the last.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Echo {
+    /// Time between repeats, in milliseconds.
+    pub delay_ms: f32,
+    /// How much of each repeat comes back again (0..1).
+    pub feedback: f32,
+    /// Level of the repeats against the original (0..1).
+    pub mix: f32,
+}
+
+impl Default for Echo {
+    fn default() -> Self {
+        Self { delay_ms: 300.0, feedback: 0.4, mix: 0.35 }
+    }
+}
+
+/// The sound of a room.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reverb {
+    /// 0..1: small room to huge hall (longer decay).
+    pub size: f32,
+    /// 0..1: how quickly high frequencies die away (soft furnishings vs bare stone).
+    pub damping: f32,
+    /// 0..1: dry original to only the reverb.
+    pub mix: f32,
+}
+
+impl Reverb {
+    pub const ROOM: Reverb = Reverb { size: 0.5, damping: 0.5, mix: 0.25 };
+    pub const HALL: Reverb = Reverb { size: 0.8, damping: 0.4, mix: 0.3 };
+    pub const CATHEDRAL: Reverb = Reverb { size: 0.95, damping: 0.2, mix: 0.35 };
+}
+
+impl Default for Reverb {
+    fn default() -> Self {
+        Self::ROOM
     }
 }
 

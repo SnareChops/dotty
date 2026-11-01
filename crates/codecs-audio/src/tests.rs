@@ -843,3 +843,29 @@ fn normalizing_measures_first_and_progress_never_goes_backwards() {
     let peak = out.iter().map(|s| s.unsigned_abs()).max().unwrap() as f32 / 32768.0;
     assert!((20.0 * peak.log10() + 6.0).abs() < 0.05, "peak {peak}");
 }
+
+#[test]
+fn effect_tails_make_the_written_file_longer() {
+    let dir = tmp("tail");
+    let (src, dst) = (dir.join("in.wav"), dir.join("out.flac"));
+    make_wav(&src, 2, 8000, 16, &signal(2, 8000, 16), &Tags::default());
+    let edits = dotty_core::Edits {
+        ops: vec![dotty_core::EditOp::Audio(dotty_core::AudioEdits {
+            echo: Some(dotty_core::Echo { delay_ms: 250.0, feedback: 0.3, mix: 0.5 }),
+            reverb: Some(dotty_core::Reverb::ROOM),
+            volume: dotty_core::Volume::Peak(-1.0),
+            ..Default::default()
+        })],
+    };
+    let cancel = AtomicBool::new(false);
+    let progress = |_: f32| {};
+    let options = Options::default();
+    let ctx = ConvertCtx::new(&options, &cancel, &progress).with_edits(Some(&edits));
+    AudioConverter::default().convert(&src, &dst, Format::Wav, Format::Flac, &ctx).unwrap();
+    let (info, out, _) = read_all(&dst, Format::Flac, 16);
+    let frames = out.len() / 2;
+    assert!(frames > 8000 + 2000, "tail adds at least a few echoes: {frames} frames");
+    assert_eq!(info.total_frames, Some(frames as u64), "FLAC header records the real length");
+    let peak = out.iter().map(|s| s.unsigned_abs()).max().unwrap() as f32 / 32768.0;
+    assert!((20.0 * peak.log10() + 1.0).abs() < 0.05, "normalized after the effects: {peak}");
+}

@@ -1,11 +1,11 @@
 //! The audio editor: a modal over the file list for quick changes before a conversion
-//! (trim, reverse, filters, volume, fades). It decodes the file into memory, plays a preview through the same stages
+//! (trim, reverse, filters, fades, echo, reverb, volume). It decodes the file into memory, plays a preview through the same stages
 //! the converter uses, and produces [`Edits`] for the job, so the source is never changed.
 
 use crate::player::{Player, Request};
 use codecs_audio::StreamInfo;
 use codecs_audio::edit::{CEILING, Measurement, Plan, decode_all, limits, measure_memory, volume_gain};
-use dotty_core::{AudioEdits, EditOp, Edits, Format, JobId, Volume};
+use dotty_core::{AudioEdits, EditOp, Edits, Format, JobId, Reverb, Volume};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -195,6 +195,8 @@ struct Session {
     /// (only the ones before that stage matter).
     measured: Option<(AudioEdits, Measurement)>,
     measuring: Option<Measuring>,
+    /// Height the controls under the waveform took last frame (they wrap on narrow windows).
+    controls_height: f32,
 }
 
 /// A measurement running in the background; dropping it cancels it.
@@ -236,6 +238,7 @@ impl Session {
             silence_db: -50.0,
             measured: None,
             measuring: None,
+            controls_height: 180.0,
         };
         s.cursor = s.result_start();
         s
@@ -308,10 +311,13 @@ impl Session {
         }
     }
 
-    /// The edits that change what the volume stage measures.
+    /// The edits that change what the volume stage measures: all but the volume.
     fn shape_key(&self) -> AudioEdits {
-        let e = &self.edits;
-        AudioEdits { trim_start: e.trim_start, trim_end: e.trim_end, reverse: e.reverse, low_cut: e.low_cut, high_cut: e.high_cut, ..Default::default() }
+        AudioEdits { volume: Volume::Gain(0.0), ..self.edits }
+    }
+
+    fn has_tail(&self) -> bool {
+        self.edits.echo.is_some() || self.edits.reverb.is_some()
     }
 
     fn measurement(&self) -> Option<&Measurement> {
@@ -433,12 +439,17 @@ impl Session {
         });
         ui.add_space(4.0);
 
-        let controls = 150.0;
-        let wave_size = ui.available_size() - egui::vec2(0.0, controls);
+        let wave_size = ui.available_size() - egui::vec2(0.0, self.controls_height + 34.0);
         let (rect, resp) = ui.allocate_exact_size(wave_size.max(egui::vec2(64.0, 80.0)), egui::Sense::click_and_drag());
         self.waveform(ui, rect, &resp);
         ui.add_space(6.0);
+        let top = ui.cursor().top();
         self.controls(ui);
+        let height = ui.cursor().top() - top;
+        if (height - self.controls_height).abs() > 0.5 {
+            self.controls_height = height;
+            ui.ctx().request_repaint();
+        }
         self.shortcuts(ui, &mut outcome);
 
         ui.horizontal(|ui| {
@@ -749,10 +760,52 @@ impl Session {
                 .on_hover_text("Fade out to silence over this long");
             self.clamp_fades();
             ui.separator();
-            ui.weak(format!("Original {} · Result {}", fmt_time(self.duration()), fmt_time(len)));
+            let tail = if self.has_tail() { " + effect tail" } else { "" };
+            ui.weak(format!("Original {} · Result {}{tail}", fmt_time(self.duration()), fmt_time(len)));
         });
-        self.volume_controls(ui);
         self.filter_controls(ui);
+        self.effect_controls(ui);
+        self.volume_controls(ui);
+    }
+
+    fn effect_controls(&mut self, ui: &mut egui::Ui) {
+        let mut indent = 0.0;
+        ui.horizontal_wrapped(|ui| {
+            indent = ui.strong("Effects").rect.width() + ui.spacing().item_spacing.x;
+            let mut on = self.edits.echo.is_some();
+            ui.checkbox(&mut on, "Echo").on_hover_text("Repeats of the sound, each quieter than the last");
+            let mut echo = self.edits.echo.unwrap_or_default();
+            ui.add_enabled_ui(on, |ui| {
+                ui.add(egui::Slider::new(&mut echo.delay_ms, 20.0..=2000.0).logarithmic(true).suffix(" ms").integer())
+                    .on_hover_text("Time between repeats");
+                ui.add(egui::Slider::new(&mut echo.feedback, 0.0..=0.9).text("repeats").fixed_decimals(2))
+                    .on_hover_text("How much of each repeat comes back again: higher rings on longer");
+                ui.add(egui::Slider::new(&mut echo.mix, 0.0..=1.0).text("level").fixed_decimals(2))
+                    .on_hover_text("How loud the repeats are");
+            });
+            self.edits.echo = on.then_some(echo);
+        });
+        ui.horizontal_wrapped(|ui| {
+            // Line up under "Echo".
+            ui.add_space(indent - ui.spacing().item_spacing.x);
+            let mut on = self.edits.reverb.is_some();
+            ui.checkbox(&mut on, "Reverb").on_hover_text("The sound of a room");
+            let mut reverb = self.edits.reverb.unwrap_or_default();
+            ui.add_enabled_ui(on, |ui| {
+                for (name, preset) in [("Room", Reverb::ROOM), ("Hall", Reverb::HALL), ("Cathedral", Reverb::CATHEDRAL)] {
+                    if ui.selectable_label(reverb == preset, name).clicked() {
+                        reverb = preset;
+                    }
+                }
+                ui.add(egui::Slider::new(&mut reverb.size, 0.0..=1.0).text("size").fixed_decimals(2))
+                    .on_hover_text("Small room to huge hall: bigger rings longer");
+                ui.add(egui::Slider::new(&mut reverb.damping, 0.0..=1.0).text("damping").fixed_decimals(2))
+                    .on_hover_text("How soon the highs die away: soft furnishings (high) or bare stone (low)");
+                ui.add(egui::Slider::new(&mut reverb.mix, 0.0..=1.0).text("mix").fixed_decimals(2))
+                    .on_hover_text("From the dry original (0) to only the reverb (1)");
+            });
+            self.edits.reverb = on.then_some(reverb);
+        });
     }
 
     fn volume_controls(&mut self, ui: &mut egui::Ui) {
@@ -802,7 +855,7 @@ impl Session {
                     if self.edits.volume.measures() {
                         text += &format!(" → {:+.1} dB", 20.0 * gain.log10());
                     }
-                    ui.weak(text).on_hover_text("Measured after trimming and filtering, before the volume change");
+                    ui.weak(text).on_hover_text("Measured with every other change applied, before the volume change");
                     if limited {
                         ui.colored_label(ui.visuals().warn_fg_color, "⚠ peaks limited").on_hover_text(
                             "This would push peaks past 0 dB, so a limiter turns them down just enough to keep them from clipping.",
@@ -1096,7 +1149,13 @@ mod tests {
         // Boosting past the ceiling engages the limiter.
         s.edits.volume = Volume::Gain(12.0);
         assert!(s.volume().1);
-        // A new trim invalidates it until measured again.
+        // Changing the volume keeps it; any other change (an effect, a trim) needs a new one.
+        s.edits.volume = Volume::Loudness(-20.0);
+        assert!(s.measurement().is_some());
+        s.edits.reverb = Some(Reverb::HALL);
+        assert!(s.measurement().is_none() && s.has_tail());
+        s.edits.reverb = None;
+        assert!(s.measurement().is_some());
         s.set_trim(1.5, 2.5);
         assert!(s.measurement().is_none());
     }

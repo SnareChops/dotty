@@ -8,7 +8,7 @@ use codecs_audio::edit::{Measurement, Plan, preview};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use dotty_core::AudioEdits;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -41,7 +41,9 @@ struct Playing {
     from: u64,
     plan: Plan,
     total: u64,
-    looping: bool,
+    /// Device frames at which each loop pass after the first begins (passes can be longer
+    /// than the kept part: echo and reverb tails).
+    passes: Arc<Mutex<Vec<u64>>>,
 }
 
 #[derive(Default)]
@@ -76,12 +78,18 @@ impl Player {
     /// The source frame being heard now, while playing.
     pub fn position(&self) -> Option<u64> {
         let p = self.playing.as_ref()?;
-        let heard = p.played.load(Ordering::Relaxed) as f64 * p.source_rate as f64 / p.device_rate as f64;
+        let played = p.played.load(Ordering::Relaxed);
+        let pass = p.passes.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().find(|&&b| b <= played).copied();
+        let to_source = |frames: u64| (frames as f64 * p.source_rate as f64 / p.device_rate as f64) as u64;
         let end = p.plan.end.unwrap_or(p.total);
         let len = end.saturating_sub(p.plan.start).max(1);
-        // Work in output order (which runs backwards through the source when reversed).
-        let at = p.plan.output_index(p.from, end) + heard as u64;
-        let at = if p.looping { at % len } else { at.min(len - 1) };
+        // Work in output order (which runs backwards through the source when reversed);
+        // during an effect tail the playhead waits at the end.
+        let at = match pass {
+            Some(b) => to_source(played - b),
+            None => p.plan.output_index(p.from, end) + to_source(played),
+        }
+        .min(len - 1);
         Some(if p.plan.reverse { end - 1 - at } else { p.plan.start + at })
     }
 
@@ -112,6 +120,7 @@ impl Player {
         let played = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
         let produced_all = Arc::new(AtomicBool::new(false));
+        let passes = Arc::new(Mutex::new(Vec::new()));
 
         let total = (req.samples.len() / req.info.channels.max(1) as usize) as u64;
         let plan = Plan::new(&req.edits, req.info.sample_rate, Some(total));
@@ -133,8 +142,10 @@ impl Player {
                 (stop.clone(), req.samples, req.info, req.edits, req.measured, req.looping);
             // Where the result begins, for looping back.
             let restart = if plan.reverse { plan.end.unwrap_or(total).saturating_sub(1) } else { plan.start };
+            let (passes, ring_channels) = (passes.clone(), channels as u64);
             thread::spawn(move || {
                 let mut start = from;
+                let mut pushed = 0u64;
                 loop {
                     let Ok(mut src) = preview(samples.clone(), &info, &edits, measured.as_ref(), start, channels, rate) else { break };
                     while let Ok(Some(chunk)) = src.next_chunk() {
@@ -149,7 +160,7 @@ impl Player {
                                 continue;
                             }
                             if let Ok(chunk) = tx.write_chunk_uninit(n) {
-                                chunk.fill_from_iter(rest[..n].iter().copied());
+                                pushed += chunk.fill_from_iter(rest[..n].iter().copied()) as u64;
                             }
                             rest = &rest[n..];
                         }
@@ -158,6 +169,7 @@ impl Player {
                         break;
                     }
                     start = restart;
+                    passes.lock().unwrap_or_else(|e| e.into_inner()).push(pushed / ring_channels);
                 }
                 produced_all.store(true, Ordering::Relaxed);
             });
@@ -173,7 +185,7 @@ impl Player {
             from,
             plan,
             total,
-            looping: req.looping,
+            passes,
         });
         Ok(())
     }
@@ -237,5 +249,20 @@ mod tests {
         assert!(pos > 4410 + 2000, "playback starts at the trim and moves: {pos}");
         thread::sleep(Duration::from_millis(600));
         assert!(!p.is_playing() && p.reap(), "finished");
+    }
+
+    #[test]
+    #[ignore]
+    fn reverb_tail_keeps_playing_with_the_playhead_at_the_end() {
+        let rate = 44_100u32;
+        let frames = rate as usize / 4;
+        let samples: Arc<[f32]> = (0..frames).map(|i| (i as f32 * 0.06).sin() * 0.05).collect();
+        let info = StreamInfo { sample_rate: rate, channels: 1, source_bits: Some(16), total_frames: Some(frames as u64), source_rate: rate };
+        let edits = AudioEdits { reverb: Some(dotty_core::Reverb::HALL), ..Default::default() };
+        let mut p = Player::default();
+        p.play(Request { samples, info, edits, measured: None, from: 0, looping: false }).unwrap();
+        thread::sleep(Duration::from_millis(700));
+        assert!(p.is_playing(), "still ringing well after the 250 ms clip");
+        assert_eq!(p.position(), Some(frames as u64 - 1));
     }
 }

@@ -1,13 +1,15 @@
 //! Audio edits as pipeline stages. The converter and the editor's preview build the same
 //! stages, so what plays in the editor is what gets written.
 //!
-//! Order: trim → reverse → filters → volume (with a limiter) → fades. Normalizing needs the
-//! level of the audio as it reaches the volume stage, so callers measure first
-//! ([`shape`] + [`measure`]) and pass the [`Measurement`] in.
+//! Order: trim → reverse → filters → fades → echo → reverb → volume (with a limiter). Fades
+//! come before the effects so a fade-out lets echoes and reverb ring out naturally (and the
+//! short fades on cut points keep clicks out of them). Normalizing needs the level of the
+//! audio as it reaches the volume stage, so callers measure first ([`shape`] + [`measure`])
+//! and pass the [`Measurement`] in.
 
 use crate::stages::{Remix, Resample};
 use crate::{AudioConverter, AudioSource, StreamInfo, Tags};
-use dotty_core::{AudioEdits, Error, Format, Result, Volume};
+use dotty_core::{AudioEdits, Echo, Error, Format, Result, Reverb, Volume};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -109,7 +111,8 @@ pub fn limits(gain: f32, measured: Option<&Measurement>) -> bool {
     measured.map_or(gain > 1.0, |m| m.peak * gain > CEILING)
 }
 
-/// The stages before the volume: trim, reverse, filters. Measure this to normalize.
+/// Every stage before the volume: trim, reverse, filters, fades, effects. Measure this to
+/// normalize.
 pub fn shape<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn AudioSource + 'a> {
     let info = src.info();
     let plan = Plan::new(edits, info.sample_rate, info.total_frames);
@@ -120,40 +123,37 @@ pub fn shape<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn 
     if edits.reverse {
         src = Box::new(Reverse::new(src));
     }
-    with_filters(src, edits)
+    after_pick(src, edits, &plan, 0)
 }
 
-fn with_filters<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits) -> Box<dyn AudioSource + 'a> {
-    let biquads = filters(edits, src.info().sample_rate);
-    if biquads.is_empty() { src } else { Box::new(Filters::new(src, biquads)) }
-}
-
-/// The stages from the volume on, for output starting `offset` frames in.
-fn finish<'a>(
-    src: Box<dyn AudioSource + 'a>,
-    edits: &AudioEdits,
-    plan: &Plan,
-    measured: Option<&Measurement>,
-    offset: u64,
-) -> Box<dyn AudioSource + 'a> {
-    let gain = volume_gain(edits.volume, measured);
-    let limit = limits(gain, measured);
+/// The stages after the kept part is picked (and reversed): filters, fades (for output
+/// starting `offset` frames in), effects.
+fn after_pick<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, plan: &Plan, offset: u64) -> Box<dyn AudioSource + 'a> {
     let mut src = src;
-    if gain != 1.0 || limit {
-        src = Box::new(Gain::new(src, gain, limit));
+    let biquads = filters(edits, src.info().sample_rate);
+    if !biquads.is_empty() {
+        src = Box::new(Filters::new(src, biquads));
     }
     if plan.fade_in > 0 || plan.fade_out > 0 {
         src = Box::new(Fade::new(src, plan, offset));
     }
+    if edits.echo.is_some() || edits.reverb.is_some() {
+        src = Box::new(Effects::new(src, edits));
+    }
     src
+}
+
+/// The volume stage.
+fn with_volume<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured: Option<&Measurement>) -> Box<dyn AudioSource + 'a> {
+    let gain = volume_gain(edits.volume, measured);
+    let limit = limits(gain, measured);
+    if gain != 1.0 || limit { Box::new(Gain::new(src, gain, limit)) } else { src }
 }
 
 /// Applies `edits` to a stream starting at its first frame (the converter's case).
 /// `measured` is [`measure`] of [`shape`] of the same stream, needed when normalizing.
 pub fn apply<'a>(src: Box<dyn AudioSource + 'a>, edits: &AudioEdits, measured: Option<&Measurement>) -> Box<dyn AudioSource + 'a> {
-    let info = src.info();
-    let plan = Plan::new(edits, info.sample_rate, info.total_frames);
-    finish(shape(src, edits), edits, &plan, measured, 0)
+    with_volume(shape(src, edits), edits, measured)
 }
 
 /// Reads `src` to the end and measures it. Stops early if `cancel` is set.
@@ -655,7 +655,7 @@ pub fn preview<'a>(
     } else {
         Box::new(MemorySource::new(samples, info, from, Some(end)))
     };
-    let mut chain = finish(with_filters(src, edits), edits, &plan, measured, plan.output_index(from, end));
+    let mut chain = with_volume(after_pick(src, edits, &plan, plan.output_index(from, end)), edits, measured);
     if channels != info.channels {
         chain = Box::new(Remix::new(chain, channels.clamp(1, 2)));
     }
@@ -663,6 +663,207 @@ pub fn preview<'a>(
         chain = Box::new(Resample::new(chain, rate)?);
     }
     Ok(chain)
+}
+
+/// One per-frame effect with a memory, so it keeps sounding after its input stops.
+trait Effect {
+    fn process(&mut self, frame: &mut [f32]);
+    /// Longest it can keep sounding after the input ends, in frames.
+    fn tail(&self) -> u64;
+    /// Longest stretch of silence it can produce mid-tail (an echo's gap), in frames.
+    fn gap(&self) -> u64 {
+        0
+    }
+}
+
+/// A delay line per channel: each repeat is fed back at `feedback`.
+struct EchoFx {
+    buf: Vec<f32>,
+    len: usize,
+    pos: usize,
+    feedback: f32,
+    mix: f32,
+}
+
+impl EchoFx {
+    fn new(e: &Echo, channels: usize, rate: u32) -> Self {
+        let len = ((e.delay_ms.max(1.0) / 1000.0 * rate as f32) as usize).max(1);
+        Self { buf: vec![0.0; len * channels], len, pos: 0, feedback: e.feedback.clamp(0.0, 0.95), mix: e.mix.clamp(0.0, 1.0) }
+    }
+}
+
+impl Effect for EchoFx {
+    fn process(&mut self, frame: &mut [f32]) {
+        let ch = frame.len();
+        let at = &mut self.buf[self.pos * ch..(self.pos + 1) * ch];
+        for (s, d) in frame.iter_mut().zip(at) {
+            let delayed = *d;
+            *d = flush(*s + self.feedback * delayed);
+            *s += self.mix * delayed;
+        }
+        self.pos = (self.pos + 1) % self.len;
+    }
+    fn tail(&self) -> u64 {
+        // Repeats until they're 80 dB down.
+        let repeats = if self.feedback > 0.0 { (1e-4f32.ln() / self.feedback.ln()).ceil() as u64 + 1 } else { 1 };
+        self.len as u64 * repeats
+    }
+    fn gap(&self) -> u64 {
+        self.len as u64
+    }
+}
+
+/// Freeverb (Jezar at Dreampoint, public domain): eight damped comb filters in parallel,
+/// then four all-pass filters in series, per channel; channels are offset slightly for width.
+struct ReverbFx {
+    channels: Vec<FreeverbChannel>,
+    feedback: f32,
+    damp: f32,
+    mix: f32,
+    longest: usize,
+}
+
+struct FreeverbChannel {
+    combs: Vec<(Vec<f32>, usize, f32)>,
+    allpasses: Vec<(Vec<f32>, usize)>,
+}
+
+const COMBS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+const ALLPASSES: [usize; 4] = [556, 441, 341, 225];
+/// Extra delay per channel (Freeverb's stereo spread).
+const SPREAD: usize = 23;
+
+impl ReverbFx {
+    fn new(r: &Reverb, channels: usize, rate: u32) -> Self {
+        // Freeverb's tunings are for 44.1 kHz.
+        let scale = |n: usize| ((n as f64 * rate as f64 / 44_100.0) as usize).max(1);
+        let channels: Vec<FreeverbChannel> = (0..channels)
+            .map(|c| FreeverbChannel {
+                combs: COMBS.iter().map(|&n| (vec![0.0; scale(n + SPREAD * c)], 0, 0.0)).collect(),
+                allpasses: ALLPASSES.iter().map(|&n| (vec![0.0; scale(n + SPREAD * c)], 0)).collect(),
+            })
+            .collect();
+        let longest = scale(COMBS[7] + SPREAD * channels.len());
+        Self {
+            channels,
+            feedback: r.size.clamp(0.0, 0.98) * 0.28 + 0.7,
+            damp: r.damping.clamp(0.0, 1.0) * 0.4,
+            mix: r.mix.clamp(0.0, 1.0),
+            longest,
+        }
+    }
+}
+
+impl Effect for ReverbFx {
+    fn process(&mut self, frame: &mut [f32]) {
+        // Every channel's reverb is fed the mix of all of them, like Freeverb's stereo input.
+        let input = frame.iter().sum::<f32>() * 0.015 * 2.0 / frame.len() as f32;
+        for (s, ch) in frame.iter_mut().zip(&mut self.channels) {
+            let mut wet = 0.0;
+            for (buf, i, store) in &mut ch.combs {
+                let out = buf[*i];
+                *store = flush(out * (1.0 - self.damp) + *store * self.damp);
+                buf[*i] = input + *store * self.feedback;
+                *i = (*i + 1) % buf.len();
+                wet += out;
+            }
+            for (buf, i) in &mut ch.allpasses {
+                let delayed = buf[*i];
+                buf[*i] = flush(wet + delayed * 0.5);
+                *i = (*i + 1) % buf.len();
+                wet = delayed - wet;
+            }
+            *s = *s * (1.0 - self.mix) + wet * 3.0 * self.mix;
+        }
+    }
+    fn tail(&self) -> u64 {
+        // Comb passes until 80 dB down, plus the all-passes.
+        let passes = (1e-4f32.ln() / self.feedback.ln()).ceil() as u64;
+        self.longest as u64 * passes + ALLPASSES.iter().sum::<usize>() as u64
+    }
+}
+
+/// Flush values too small to hear to zero: decaying feedback otherwise ends up in
+/// denormal floats, which are very slow on some CPUs.
+fn flush(x: f32) -> f32 {
+    if x.abs() < 1e-20 { 0.0 } else { x }
+}
+
+/// Runs echo and reverb, then keeps going after the input ends until they've died away
+/// (silent for longer than any echo gap) or their longest tail is over.
+struct Effects<S> {
+    inner: S,
+    info: StreamInfo,
+    fx: Vec<Box<dyn Effect>>,
+    buf: Vec<f32>,
+    ended: bool,
+    tail_left: u64,
+    quiet: u64,
+    quiet_enough: u64,
+}
+
+/// Below this (−80 dBFS) a tail counts as silent.
+const SILENT: f32 = 1e-4;
+/// Most an effect tail may add, in seconds.
+const MAX_TAIL: f64 = 30.0;
+
+impl<S: AudioSource> Effects<S> {
+    fn new(inner: S, edits: &AudioEdits) -> Self {
+        let mut info = inner.info().clone();
+        let (ch, rate) = (info.channels as usize, info.sample_rate);
+        let mut fx: Vec<Box<dyn Effect>> = Vec::new();
+        if let Some(e) = &edits.echo {
+            fx.push(Box::new(EchoFx::new(e, ch, rate)));
+        }
+        if let Some(r) = &edits.reverb {
+            fx.push(Box::new(ReverbFx::new(r, ch, rate)));
+        }
+        // Echoes of reverb (or reverb of echoes) last about as long as both together.
+        let tail = fx.iter().map(|f| f.tail()).sum::<u64>().min((MAX_TAIL * rate as f64) as u64);
+        let quiet_enough = fx.iter().map(|f| f.gap()).max().unwrap_or(0) + rate as u64 / 20;
+        info.total_frames = None;
+        Self { inner, info, fx, buf: Vec::new(), ended: false, tail_left: tail, quiet: 0, quiet_enough }
+    }
+}
+
+impl<S: AudioSource> AudioSource for Effects<S> {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+    fn tags(&self) -> &Tags {
+        self.inner.tags()
+    }
+    fn next_chunk(&mut self) -> Result<Option<&[f32]>> {
+        let ch = self.info.channels as usize;
+        self.buf.clear();
+        if !self.ended {
+            match self.inner.next_chunk()? {
+                Some(chunk) => self.buf.extend_from_slice(chunk),
+                None => self.ended = true,
+            }
+        }
+        if self.ended {
+            if self.tail_left == 0 || self.quiet >= self.quiet_enough {
+                return Ok(None);
+            }
+            let n = (CHUNK as u64).min(self.tail_left);
+            self.tail_left -= n;
+            self.buf.resize(n as usize * ch, 0.0);
+        }
+        for frame in self.buf.chunks_exact_mut(ch) {
+            for f in &mut self.fx {
+                f.process(frame);
+            }
+            if self.ended {
+                let loud = frame.iter().any(|s| s.abs() >= SILENT);
+                self.quiet = if loud { 0 } else { self.quiet + 1 };
+            }
+        }
+        Ok(Some(&self.buf))
+    }
+    fn end_note(&self) -> Option<String> {
+        self.inner.end_note()
+    }
 }
 
 /// Measures the editor's in-memory copy as the volume stage will see it.
@@ -847,5 +1048,49 @@ mod tests {
         assert_eq!(part.len(), 4001 * 2);
         assert_eq!(&full[full.len() - part.len()..], &part[..]);
         assert_eq!(plan.output_index(5000, 9000), 3999);
+    }
+
+    fn impulse(channels: u16, frames: usize) -> Arc<[f32]> {
+        let mut v = vec![0.0; frames * channels as usize];
+        v[..channels as usize].fill(1.0);
+        v.into()
+    }
+
+    #[test]
+    fn echo_repeats_at_the_delay_and_rings_on_past_the_end() {
+        let e = AudioEdits { echo: Some(Echo { delay_ms: 100.0, feedback: 0.5, mix: 0.8 }), ..Default::default() };
+        let out = drain(apply(Box::new(MemorySource::new(impulse(1, 50), &info(1, 50), 0, None)), &e, None));
+        assert_eq!(out[0], 1.0);
+        assert!((out[100] - 0.8).abs() < 1e-6 && (out[200] - 0.4).abs() < 1e-6 && (out[300] - 0.2).abs() < 1e-6);
+        assert!(out[1..100].iter().all(|&s| s == 0.0));
+        // Stops once the repeats are below −80 dB, rather than running to the cap.
+        let last = out.iter().rposition(|s| s.abs() > 0.0).unwrap();
+        assert!(out.len() > 1300 && out.len() < 1500 + 4096, "{} frames, last sound at {last}", out.len());
+    }
+
+    #[test]
+    fn a_long_echo_gap_is_not_mistaken_for_the_end() {
+        let e = AudioEdits { echo: Some(Echo { delay_ms: 2000.0, feedback: 0.3, mix: 0.5 }), ..Default::default() };
+        let out = drain(apply(Box::new(MemorySource::new(impulse(1, 10), &info(1, 10), 0, None)), &e, None));
+        assert!((out[2000] - 0.5).abs() < 1e-6 && (out[4000] - 0.15).abs() < 1e-6, "second repeat survives the 2 s gap");
+    }
+
+    #[test]
+    fn reverb_decays_after_a_fade_out_and_spreads_the_channels() {
+        let rate = 44_100;
+        let samples: Arc<[f32]> = sine(440.0, 0.5, rate, 0.5).into_iter().flat_map(|s| [s, s]).collect();
+        let i = info_at(rate, 2, samples.len() / 2);
+        let e = AudioEdits { reverb: Some(Reverb::HALL), fade_out: 0.1, ..Default::default() };
+        let out = drain(apply(Box::new(MemorySource::new(samples.clone(), &i, 0, None)), &e, None));
+        let n = samples.len();
+        assert!(out.len() > n + rate as usize * 2, "a hall rings for seconds: {} extra frames", (out.len() - n) / 2);
+        assert!(out.len() < n + rate as usize * 2 * MAX_TAIL as usize);
+        let tail = &out[n..];
+        assert!(tail[..2000].iter().any(|s| s.abs() > 1e-3), "the tail carries on after the faded end");
+        assert!(tail[tail.len() - 2000..].iter().all(|s| s.abs() < 1e-3), "and dies away");
+        assert!(out.as_chunks::<2>().0.iter().any(|f| (f[0] - f[1]).abs() > 1e-3), "left and right differ");
+        // Preview from the start is the same render.
+        let p = drain(preview(samples, &i, &e, None, 0, 2, rate).unwrap());
+        assert_eq!(p, out);
     }
 }
