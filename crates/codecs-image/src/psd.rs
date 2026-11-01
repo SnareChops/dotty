@@ -2,7 +2,7 @@
 //! layers in PSD and PSB files. Layers themselves aren't composited.
 
 use image::{DynamicImage, ImageBuffer, Luma, LumaA, Rgb, Rgba};
-use transformer_core::{Error, Result};
+use dotty_core::{Error, Result};
 
 fn err(msg: &str) -> Error {
     Error::Codec(format!("psd: {msg}"))

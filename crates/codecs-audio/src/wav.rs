@@ -3,7 +3,7 @@
 use crate::tags::Tags;
 use crate::{AudioEncoder, AudioSource, SampleFormat, quantize, sample_format};
 use std::io::{Read, Seek, SeekFrom, Write};
-use transformer_core::{Choice, ConvertCtx, Format, WriteSeek};
+use dotty_core::{Choice, ConvertCtx, Format, WriteSeek};
 
 pub const WAV_DEPTH: Choice = Choice {
     key: "depth",
@@ -24,7 +24,7 @@ impl AudioEncoder for WavEncoder {
         vec![WAV_DEPTH]
     }
 
-    fn encode(&self, src: &mut dyn AudioSource, tags: &Tags, ctx: &ConvertCtx, out: &mut dyn WriteSeek) -> transformer_core::Result<()> {
+    fn encode(&self, src: &mut dyn AudioSource, tags: &Tags, ctx: &ConvertCtx, out: &mut dyn WriteSeek) -> dotty_core::Result<()> {
         let info = src.info().clone();
         let format = sample_format(ctx.options.choice(Format::Wav, &WAV_DEPTH), info.source_bits);
         let mut wav = WavWriter::new(out, info.channels, info.sample_rate, format, tags)?;
@@ -54,12 +54,12 @@ pub struct WavWriter<W: Write + Seek> {
     buf: Vec<u8>,
 }
 
-fn io(e: std::io::Error) -> transformer_core::Error {
-    transformer_core::Error::Codec(format!("write failed: {e}"))
+fn io(e: std::io::Error) -> dotty_core::Error {
+    dotty_core::Error::Codec(format!("write failed: {e}"))
 }
 
 impl<W: Write + Seek> WavWriter<W> {
-    pub fn new(mut out: W, channels: u16, sample_rate: u32, format: SampleFormat, tags: &Tags) -> transformer_core::Result<Self> {
+    pub fn new(mut out: W, channels: u16, sample_rate: u32, format: SampleFormat, tags: &Tags) -> dotty_core::Result<Self> {
         let (bits, float) = match format {
             SampleFormat::Int(b) => (b as u16, false),
             SampleFormat::Float => (32, true),
@@ -109,7 +109,7 @@ impl<W: Write + Seek> WavWriter<W> {
     }
 
     /// Write interleaved float samples (float writers only).
-    pub fn write_f32(&mut self, samples: &[f32]) -> transformer_core::Result<()> {
+    pub fn write_f32(&mut self, samples: &[f32]) -> dotty_core::Result<()> {
         self.buf.clear();
         for &s in samples {
             self.buf.extend_from_slice(&s.to_le_bytes());
@@ -119,7 +119,7 @@ impl<W: Write + Seek> WavWriter<W> {
     }
 
     /// Write interleaved samples already quantised to the writer's bit depth.
-    pub fn write(&mut self, samples: &[i32]) -> transformer_core::Result<()> {
+    pub fn write(&mut self, samples: &[i32]) -> dotty_core::Result<()> {
         self.buf.clear();
         for &s in samples {
             self.buf.extend_from_slice(&s.to_le_bytes()[..self.bytes_per_sample]);
@@ -128,13 +128,13 @@ impl<W: Write + Seek> WavWriter<W> {
         self.out.write_all(&self.buf).map_err(io)
     }
 
-    pub fn finish(mut self) -> transformer_core::Result<()> {
+    pub fn finish(mut self) -> dotty_core::Result<()> {
         if self.data_bytes % 2 == 1 {
             self.out.write_all(&[0]).map_err(io)?; // chunk padding
         }
         let end = self.out.stream_position().map_err(io)?;
         if end > u32::MAX as u64 {
-            return Err(transformer_core::Error::Codec("WAV output would exceed 4 GiB".into()));
+            return Err(dotty_core::Error::Codec("WAV output would exceed 4 GiB".into()));
         }
         self.out.seek(SeekFrom::Start(4)).map_err(io)?;
         self.out.write_all(&((end - 8) as u32).to_le_bytes()).map_err(io)?;

@@ -4,7 +4,7 @@
 use crate::{ImageData, ImageEncoder, codec_err};
 use image::codecs::{bmp, hdr, ico, jpeg, openexr, pnm, qoi, tga};
 use image::{DynamicImage, ExtendedColorType};
-use transformer_core::{Choice, ConvertCtx, Error, Format, Preset, Result, WriteSeek};
+use dotty_core::{Choice, ConvertCtx, Error, Format, Preset, Result, WriteSeek};
 
 use DynamicImage::*;
 

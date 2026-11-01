@@ -4,7 +4,7 @@
 use codecs_image::ImageConverter;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use transformer_core::{ConvertCtx, Converter, Format, Options, Preset};
+use dotty_core::{ConvertCtx, Converter, Format, Options, Preset};
 
 #[test]
 fn converts_all_sample_images_to_all_formats() {

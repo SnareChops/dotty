@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and run Transformer. Usage: ./run [command] [args...]
+# Build and run Dotty. Usage: ./run [command] [args...]
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -25,14 +25,14 @@ EOF
 cmd="${1:-release}"
 case "$cmd" in
     -h|--help|help) usage ;;
-    release) shift || true; cargo run --release -p transformer-app -- "$@" ;;
-    dev)     shift; cargo run -p transformer-app -- "$@" ;;
-    build)   cargo build --release -p transformer-app ;;
+    release) shift || true; cargo run --release -p dotty-app -- "$@" ;;
+    dev)     shift; cargo run -p dotty-app -- "$@" ;;
+    build)   cargo build --release -p dotty-app ;;
     windows)
-        cargo build --release -p transformer-app --target x86_64-pc-windows-gnu
+        cargo build --release -p dotty-app --target x86_64-pc-windows-gnu
         mkdir -p dist
-        cp target/x86_64-pc-windows-gnu/release/transformer-app.exe dist/Transformer-win64.exe
-        echo "dist/Transformer-win64.exe"
+        cp target/x86_64-pc-windows-gnu/release/dotty.exe dist/Dotty-win64.exe
+        echo "dist/Dotty-win64.exe"
         ;;
     test)
         [ -d testdata ] || ./scripts/fetch-testdata.sh
@@ -44,5 +44,5 @@ case "$cmd" in
         ;;
     data)    ./scripts/fetch-testdata.sh ;;
     clean)   cargo clean ;;
-    *)       cargo run --release -p transformer-app -- "$@" ;;
+    *)       cargo run --release -p dotty-app -- "$@" ;;
 esac

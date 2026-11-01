@@ -810,19 +810,20 @@ dependencies = [
 name = "codecs-audio"
 version = "0.1.0"
 dependencies = [
+ "dotty-core",
  "flacenc",
  "opus-pure",
  "oxideav-vorbis",
  "rubato",
  "rusty_mp3",
  "symphonia",
- "transformer-core",
 ]
 
 [[package]]
 name = "codecs-image"
 version = "0.1.0"
 dependencies = [
+ "dotty-core",
  "image",
  "jxl-oxide",
  "oxideav-avif",
@@ -831,7 +832,6 @@ dependencies = [
  "rusty_webp",
  "tiff",
  "tola-webp",
- "transformer-core",
  "zune-core",
  "zune-jpegxl",
 ]
@@ -1062,6 +1062,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
+]
+
+[[package]]
+name = "dotty-app"
+version = "0.1.0"
+dependencies = [
+ "codecs-audio",
+ "codecs-image",
+ "dotty-core",
+ "eframe",
+ "rfd",
+ "winit",
+]
+
+[[package]]
+name = "dotty-core"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4735,26 +4755,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "transformer-app"
-version = "0.1.0"
-dependencies = [
- "codecs-audio",
- "codecs-image",
- "eframe",
- "rfd",
- "transformer-core",
- "winit",
-]
-
-[[package]]
-name = "transformer-core"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "thiserror 2.0.21",
 ]
 
 [[package]]

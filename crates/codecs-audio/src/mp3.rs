@@ -7,7 +7,7 @@ use crate::tags::Tags;
 use crate::{AudioEncoder, AudioSource};
 use rusty_mp3::{Mp3Encoder, Mp3EncoderConfig, vbr_quality_index};
 use std::io::SeekFrom;
-use transformer_core::{Choice, ConvertCtx, Error, Format, Preset, Result, WriteSeek};
+use dotty_core::{Choice, ConvertCtx, Error, Format, Preset, Result, WriteSeek};
 
 /// Every sample rate MPEG-1/2/2.5 Layer III can carry.
 const MP3_RATES: [u32; 9] = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000];

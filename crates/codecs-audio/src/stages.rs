@@ -3,7 +3,7 @@
 
 use crate::resample::StreamResampler;
 use crate::{AudioSource, StreamInfo, Tags};
-use transformer_core::{ConvertCtx, Result};
+use dotty_core::{ConvertCtx, Result};
 
 /// Reports progress as frames come out of the decoder and stops when cancelled.
 pub(crate) struct Metered<'a, 'c, S> {

@@ -1,7 +1,7 @@
 use super::*;
 use crate::wav::WavWriter;
 use std::sync::atomic::AtomicBool;
-use transformer_core::{Options, Preset};
+use dotty_core::{Options, Preset};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("tf-aud-{}-{name}", std::process::id()));
@@ -610,7 +610,7 @@ impl AudioEncoder for Picky {
     fn sample_rate(&self, _: u32) -> u32 {
         16000
     }
-    fn encode(&self, src: &mut dyn AudioSource, _: &Tags, _: &ConvertCtx, _: &mut dyn transformer_core::WriteSeek) -> Result<()> {
+    fn encode(&self, src: &mut dyn AudioSource, _: &Tags, _: &ConvertCtx, _: &mut dyn dotty_core::WriteSeek) -> Result<()> {
         let mut n = 0;
         while let Some(c) = src.next_chunk()? {
             n += c.len();
@@ -648,7 +648,7 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
 
-fn opts(to: Format, choices: &[(transformer_core::Choice, &str)]) -> Options {
+fn opts(to: Format, choices: &[(dotty_core::Choice, &str)]) -> Options {
     let mut o = Options::default();
     for (c, v) in choices {
         o.set_choice(to, c, v);

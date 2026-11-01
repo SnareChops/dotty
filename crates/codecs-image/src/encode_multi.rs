@@ -4,7 +4,7 @@ use crate::encode::write;
 use crate::{ImageData, ImageEncoder, codec_err, webp_meta};
 use image::codecs::{gif, png};
 use image::DynamicImage;
-use transformer_core::{Choice, ConvertCtx, Error, Format, Preset, Result, WriteSeek};
+use dotty_core::{Choice, ConvertCtx, Error, Format, Preset, Result, WriteSeek};
 
 use DynamicImage::*;
 

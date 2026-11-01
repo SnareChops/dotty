@@ -6,7 +6,7 @@
 use resvg::{tiny_skia, usvg};
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
-use transformer_core::{Caption, CaptionFont, Captions};
+use dotty_core::{Caption, CaptionFont, Captions};
 
 const ANTON: &[u8] = include_bytes!("../fonts/Anton-Regular.ttf");
 /// Line spacing as a multiple of the font size.

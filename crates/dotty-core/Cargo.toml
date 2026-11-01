@@ -1,5 +1,5 @@
 [package]
-name = "transformer-core"
+name = "dotty-core"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

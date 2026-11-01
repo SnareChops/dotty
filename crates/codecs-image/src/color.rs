@@ -2,7 +2,7 @@
 
 use crate::ImageData;
 use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
-use transformer_core::{Choice, Format, Options};
+use dotty_core::{Choice, Format, Options};
 
 pub const HIGHLIGHTS: Choice = Choice {
     key: "highlights",

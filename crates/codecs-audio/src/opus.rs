@@ -8,7 +8,7 @@ use crate::tags::Tags;
 use crate::{AudioEncoder, AudioSource};
 use opus_pure::{Application, MAX_PACKET_BYTES, OggOpusWriter, OpusEncoder, OpusHead, OpusTags, RateControl};
 use std::io::Write;
-use transformer_core::{Choice, ConvertCtx, Error, Format, Preset, Result, WriteSeek};
+use dotty_core::{Choice, ConvertCtx, Error, Format, Preset, Result, WriteSeek};
 
 /// Sample rates the Opus encoder accepts directly.
 const NATIVE_RATES: [u32; 5] = [8000, 12000, 16000, 24000, 48000];
@@ -73,7 +73,7 @@ fn encode(src: &mut dyn AudioSource, tags: &Tags, ctx: &ConvertCtx, out: &mut dy
     let pre_skip = head.pre_skip as usize;
 
     let mut opus_tags = OpusTags::new();
-    opus_tags.vendor = "Transformer".into();
+    opus_tags.vendor = "Dotty".into();
     for (k, v) in tags.vorbis_fields() {
         opus_tags.push(k, &v).map_err(codec)?;
     }

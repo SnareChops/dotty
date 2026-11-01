@@ -32,7 +32,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use transformer_core::{Choice, ConvertCtx, Converter, Error, Format, Registry, Result, WriteSeek, output};
+use dotty_core::{Choice, ConvertCtx, Converter, Error, Format, Registry, Result, WriteSeek, output};
 
 #[derive(Clone)]
 pub struct Frame {

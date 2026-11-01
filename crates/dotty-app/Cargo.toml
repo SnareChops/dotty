@@ -1,13 +1,17 @@
 [package]
-name = "transformer-app"
+name = "dotty-app"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[[bin]]
+name = "dotty"
+path = "src/main.rs"
 
 [dependencies]
 codecs-audio = { version = "0.1.0", path = "../codecs-audio" }
 codecs-image = { version = "0.1.0", path = "../codecs-image" }
 eframe = { version = "0.37.0", features = ["persistence"] }
 rfd = "0.17.2"
-transformer-core = { version = "0.1.0", path = "../transformer-core" }
+dotty-core = { version = "0.1.0", path = "../dotty-core" }
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }

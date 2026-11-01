@@ -7,7 +7,7 @@ use flacenc::component::BitRepr;
 use flacenc::error::{SourceError, SourceErrorReason, Verify};
 use flacenc::source::{Fill, Source};
 use std::collections::VecDeque;
-use transformer_core::{Choice, ConvertCtx, Error, Format, Result, WriteSeek};
+use dotty_core::{Choice, ConvertCtx, Error, Format, Result, WriteSeek};
 
 struct ReaderSource<'a> {
     reader: &'a mut dyn AudioSource,
@@ -125,7 +125,7 @@ fn splice_vorbis_comment(flac: &[u8], tags: &Tags) -> Vec<u8> {
     if fields.is_empty() || flac.len() < STREAMINFO_END || &flac[..4] != b"fLaC" {
         return flac.to_vec();
     }
-    let vendor = b"Transformer";
+    let vendor = b"Dotty";
     let mut body = Vec::new();
     body.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
     body.extend_from_slice(vendor);

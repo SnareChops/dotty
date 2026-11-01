@@ -7,7 +7,7 @@ use editor::{Editor, Outcome};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::Arc;
-use transformer_core::{
+use dotty_core::{
     Choice, Edits, Format, JobEvent, JobId, JobRequest, JobRunner, Kind, Options, Preset, Registry,
 };
 
@@ -677,14 +677,14 @@ fn main() -> eframe::Result {
         event_loop_builder: Some(Box::new(prefer_x11)),
         ..Default::default()
     };
-    eframe::run_native("Transformer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("Dotty", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
-    use transformer_core::{EditOp, Mask, Region};
+    use dotty_core::{EditOp, Mask, Region};
 
     fn app() -> App {
         App::build(egui::Context::default(), Options::default())

@@ -23,7 +23,7 @@ use stages::{Metered, Remix, Resample};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use transformer_core::{Choice, ConvertCtx, Converter, Error, Format, Registry, Result, WriteSeek};
+use dotty_core::{Choice, ConvertCtx, Converter, Error, Format, Registry, Result, WriteSeek};
 
 #[derive(Debug, Clone)]
 pub struct StreamInfo {

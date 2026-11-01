@@ -2,7 +2,7 @@
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
-use transformer_core::{Error, Result};
+use dotty_core::{Error, Result};
 
 fn err(e: impl std::fmt::Display) -> Error {
     Error::Codec(format!("resampler: {e}"))

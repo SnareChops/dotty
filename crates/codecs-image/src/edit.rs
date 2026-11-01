@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use resvg::tiny_skia;
-use transformer_core::{Captions, ConvertCtx, Drawing, EditOp, Edits, Error, Format, Mask, Options, Region, Result};
+use dotty_core::{Captions, ConvertCtx, Drawing, EditOp, Edits, Error, Format, Mask, Options, Region, Result};
 
 pub use image::RgbaImage as Rgba8Image;
 
@@ -488,7 +488,7 @@ mod tests {
 
     fn line(color: [u8; 4]) -> Drawing {
         // A 2-px horizontal line across the middle of a 10x10 working copy.
-        let stroke = transformer_core::Stroke { points: vec![(0.0, 5.0), (10.0, 5.0)], width: 2.0, color };
+        let stroke = dotty_core::Stroke { points: vec![(0.0, 5.0), (10.0, 5.0)], width: 2.0, color };
         Drawing { strokes: vec![stroke], of_width: 10, of_height: 10 }
     }
 
@@ -502,7 +502,7 @@ mod tests {
 
         // Grey becomes colour; a dot is a filled circle.
         let mut grey = ImageData::still(ImageLuma8(image::GrayImage::from_pixel(10, 10, image::Luma([0]))));
-        let dot = transformer_core::Stroke { points: vec![(5.0, 5.0)], width: 4.0, color: [0, 255, 0, 255] };
+        let dot = dotty_core::Stroke { points: vec![(5.0, 5.0)], width: 4.0, color: [0, 255, 0, 255] };
         apply(&mut grey, &Edits { ops: vec![EditOp::Draw(Drawing { strokes: vec![dot], of_width: 10, of_height: 10 })] });
         let out = grey.first().as_rgb8().expect("colour");
         assert_eq!(out.get_pixel(5, 5).0, [0, 255, 0]);
@@ -529,12 +529,12 @@ mod tests {
     fn captions_are_written_on_every_frame_and_cropped_after() {
         let mut img = ImageData::still(ImageRgb8(image::RgbImage::from_pixel(40, 40, image::Rgb([30, 60, 90]))));
         img.frames.push(crate::Frame { image: ImageRgb8(image::RgbImage::from_pixel(40, 40, image::Rgb([30, 60, 90]))), delay: Default::default() });
-        let caption = transformer_core::Caption {
+        let caption = dotty_core::Caption {
             text: "I".into(),
             x: 10.0,
             y: 10.0,
             size: 12.0,
-            font: transformer_core::CaptionFont::Meme,
+            font: dotty_core::CaptionFont::Meme,
             uppercase: true,
             fill: [255, 255, 0, 255],
             outline: [0, 0, 0, 255],

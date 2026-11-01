@@ -4,7 +4,7 @@ use image::{ExtendedColorType, ImageDecoder as _, ImageEncoder as _, ImageReader
 use std::sync::atomic::AtomicBool;
 use std::fs::File;
 use std::io::BufWriter;
-use transformer_core::{Choice, Options, Preset};
+use dotty_core::{Choice, Options, Preset};
 
 /// Every format we can write.
 fn outputs() -> Vec<Format> {
@@ -336,7 +336,7 @@ fn encoder_capabilities_match_format_metadata() {
     for e in &c.encoders {
         assert_eq!(e.animated(), e.format().animated_output(), "{}", e.format());
         assert_eq!(e.pages(), e.format().paged_output(), "{}", e.format());
-        assert_eq!(e.format().kind(), transformer_core::Kind::Image);
+        assert_eq!(e.format().kind(), dotty_core::Kind::Image);
     }
 }
 
@@ -624,8 +624,8 @@ fn edits_apply_in_the_pipeline_including_same_format() {
     image::RgbImage::from_pixel(8, 8, image::Rgb([200, 100, 50])).save(&src).unwrap();
     let mut keep = vec![255u8; 64];
     keep[..8].fill(0); // remove the top row
-    let edits = transformer_core::Edits {
-        ops: vec![transformer_core::EditOp::Erase { frame: 0, mask: transformer_core::Mask::new(8, 8, keep) }],
+    let edits = dotty_core::Edits {
+        ops: vec![dotty_core::EditOp::Erase { frame: 0, mask: dotty_core::Mask::new(8, 8, keep) }],
     };
     let (cancel, progress, opts) = (AtomicBool::new(false), |_: f32| {}, Options::default());
     let ctx = ConvertCtx::new(&opts, &cancel, &progress).with_edits(Some(&edits));
@@ -656,12 +656,12 @@ fn animation_keeps_a_different_erase_per_frame() {
     // Frame 0 loses its top-left quarter, frame 2 its bottom-right; frame 1 is untouched.
     let quarter = |at: (u32, u32)| {
         let data = (0..16).map(|i| if (i % 4 / 2, i / 4 / 2) == at { 0 } else { 255 }).collect();
-        transformer_core::Mask::new(4, 4, data)
+        dotty_core::Mask::new(4, 4, data)
     };
-    let edits = transformer_core::Edits {
+    let edits = dotty_core::Edits {
         ops: vec![
-            transformer_core::EditOp::Erase { frame: 0, mask: quarter((0, 0)) },
-            transformer_core::EditOp::Erase { frame: 2, mask: quarter((1, 1)) },
+            dotty_core::EditOp::Erase { frame: 0, mask: quarter((0, 0)) },
+            dotty_core::EditOp::Erase { frame: 2, mask: quarter((1, 1)) },
         ],
     };
     let opts = with_choice(Format::Webp, ANIMATION, "all");

@@ -7,7 +7,7 @@ use image::{DynamicImage, ImageBuffer};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use transformer_core::{Choice, ConvertCtx, Error, Format, Result};
+use dotty_core::{Choice, ConvertCtx, Error, Format, Result};
 
 fn read(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| io_err(path, e))

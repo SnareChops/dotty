@@ -4,7 +4,7 @@
 use crate::tags::Tags;
 use crate::{AudioEncoder, AudioSource, PCM_DEPTH, SampleFormat, id3, quantize, sample_format};
 use std::io::SeekFrom;
-use transformer_core::{Choice, ConvertCtx, Error, Format, Result, WriteSeek};
+use dotty_core::{Choice, ConvertCtx, Error, Format, Result, WriteSeek};
 
 fn io(e: std::io::Error) -> Error {
     Error::Codec(format!("write failed: {e}"))

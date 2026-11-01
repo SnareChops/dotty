@@ -16,7 +16,7 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag};
-use transformer_core::{Error, Format, Result};
+use dotty_core::{Error, Format, Result};
 
 /// Any format `symphonia` reads (registered once per format).
 pub struct SymphoniaDecoder(pub Format);

@@ -12,7 +12,7 @@ use oxideav_vorbis::encoder::write_comment_header;
 use oxideav_vorbis::oggfile::{StreamEncoderConfig, encode_pcm_to_packets, mux_vorbis_stream};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
-use transformer_core::{ConvertCtx, Error, Format, Preset, Result, WriteSeek};
+use dotty_core::{ConvertCtx, Error, Format, Preset, Result, WriteSeek};
 
 /// Quality knob for the encoder (0..1). Its floor is already ~70-130 kbps; there is no
 /// smaller-than-that setting short of the (much slower) bitrate-targeting mode.
@@ -94,7 +94,7 @@ fn encode(src: &mut dyn AudioSource, tags: &Tags, ctx: &ConvertCtx, out: &mut dy
     };
 
     let comments = tags.vorbis_fields().into_iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let comment = write_comment_header(&VorbisCommentHeader { vendor: "Transformer".into(), comments })
+    let comment = write_comment_header(&VorbisCommentHeader { vendor: "Dotty".into(), comments })
         .map_err(|e| Error::Codec(format!("vorbis comment header: {e:?}")))?;
     let serial = 0x5446_0001 ^ (n as u32);
     let ogg = mux_vorbis_stream(serial, &stream.identification, &comment, &stream.setup, &stream.audio)

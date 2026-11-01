@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::time::Duration;
-use transformer_core::{Choice, ConvertCtx, Error, Format, Result};
+use dotty_core::{Choice, ConvertCtx, Error, Format, Result};
 
 /// Refuse decompression bombs: 8 GiB of pixel data is far beyond any real photo.
 const MAX_ALLOC: u64 = 8 << 30;

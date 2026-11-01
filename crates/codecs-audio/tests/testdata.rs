@@ -5,7 +5,7 @@
 use codecs_audio::{AudioConverter, AudioSource};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use transformer_core::{ConvertCtx, Converter, Format, Options};
+use dotty_core::{ConvertCtx, Converter, Format, Options};
 
 fn frames(path: &std::path::Path, fmt: Format) -> (u32, u16, u64) {
     let mut r = AudioConverter::default().open(path, fmt).unwrap();

@@ -15,4 +15,4 @@ tiff = "0.11.3"
 zune-core = "0.5.3"
 zune-jpegxl = "0.5.2"
 tola-webp = "0.8.1"
-transformer-core = { version = "0.1.0", path = "../transformer-core" }
+dotty-core = { version = "0.1.0", path = "../dotty-core" }

@@ -9,7 +9,7 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
-use transformer_core::{Caption, CaptionFont, Captions, Drawing, EditOp, Edits, Format, JobId, Mask, Options, Region, Stroke};
+use dotty_core::{Caption, CaptionFont, Captions, Drawing, EditOp, Edits, Format, JobId, Mask, Options, Region, Stroke};
 
 /// Longest side the editor works at. Bigger images are edited scaled down and the edits are
 /// stretched back up, which keeps every click and slider drag fast.

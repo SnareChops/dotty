@@ -4,7 +4,7 @@
 
 use codecs_image::ImageConverter;
 use std::sync::atomic::AtomicBool;
-use transformer_core::{ConvertCtx, Converter, Format, Options, Preset};
+use dotty_core::{ConvertCtx, Converter, Format, Options, Preset};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
