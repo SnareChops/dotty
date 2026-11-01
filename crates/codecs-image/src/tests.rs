@@ -641,3 +641,40 @@ fn edits_apply_in_the_pipeline_including_same_format() {
     assert!(!ctx.take_notes().is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn animation_keeps_a_different_erase_per_frame() {
+    let dir = tmp("anim-edits");
+    let gif = dir.join("a.gif");
+    animated_gif(&gif, &[50, 150, 250]);
+
+    // The editor sees every frame, within its pixel budget.
+    let (frames, full) = crate::edit::decode_for_edit(&gif, Format::Gif, &Options::default(), 4096, 3 * 16).unwrap();
+    assert_eq!((frames.len(), full), (3, (8, 8)));
+    assert_eq!(frames[0].dimensions(), (4, 4), "3 frames in 48 pixels: 4x4 each");
+
+    // Frame 0 loses its top-left quarter, frame 2 its bottom-right; frame 1 is untouched.
+    let quarter = |at: (u32, u32)| {
+        let data = (0..16).map(|i| if (i % 4 / 2, i / 4 / 2) == at { 0 } else { 255 }).collect();
+        transformer_core::Mask::new(4, 4, data)
+    };
+    let edits = transformer_core::Edits {
+        ops: vec![
+            transformer_core::EditOp::Erase { frame: 0, mask: quarter((0, 0)) },
+            transformer_core::EditOp::Erase { frame: 2, mask: quarter((1, 1)) },
+        ],
+    };
+    let opts = with_choice(Format::Webp, ANIMATION, "all");
+    let (cancel, progress) = (AtomicBool::new(false), |_: f32| {});
+    let ctx = ConvertCtx::new(&opts, &cancel, &progress).with_edits(Some(&edits));
+    let out = dir.join("a.webp");
+    ImageConverter::default().convert(&gif, &out, Format::Gif, Format::Webp, &ctx).unwrap();
+
+    let back = decode_all(&out, Format::Webp);
+    assert_eq!(back.frames.len(), 3, "still animated");
+    let alpha = |f: usize, x: u32, y: u32| back.frames[f].image.to_rgba8().get_pixel(x, y).0[3];
+    assert_eq!((alpha(0, 1, 1), alpha(0, 6, 6)), (0, 255));
+    assert_eq!((alpha(1, 1, 1), alpha(1, 6, 6)), (255, 255));
+    assert_eq!((alpha(2, 1, 1), alpha(2, 6, 6)), (255, 0));
+    std::fs::remove_dir_all(&dir).ok();
+}

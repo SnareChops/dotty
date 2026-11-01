@@ -9,6 +9,7 @@
 //! Pixel convention: float images are linear light (HDR / EXR), integer images are
 //! sRGB-encoded. The pipeline converts between the two for the encoder.
 
+pub mod caption;
 mod color;
 mod decode;
 mod decode_extra;

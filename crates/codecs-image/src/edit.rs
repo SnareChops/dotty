@@ -1,4 +1,4 @@
-//! Editor support: applying [`Edits`] in the pipeline (erase, then crop), and the
+//! Editor support: applying [`Edits`] in the pipeline (erase, draw, text, then crop), and the
 //! selection tools the editor runs on an 8-bit preview of the image.
 //!
 //! Selections and masks are one byte per pixel (0 = none, 255 = full), so soft edges
@@ -11,7 +11,8 @@ use image::{GrayImage, RgbaImage};
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use transformer_core::{ConvertCtx, EditOp, Edits, Error, Format, Mask, Options, Region, Result};
+use resvg::tiny_skia;
+use transformer_core::{Captions, ConvertCtx, Drawing, EditOp, Edits, Error, Format, Mask, Options, Region, Result};
 
 pub use image::RgbaImage as Rgba8Image;
 
@@ -22,6 +23,31 @@ pub fn apply(img: &mut ImageData, edits: &Edits) {
             EditOp::Erase { frame, mask } => {
                 if let Some(f) = img.frames.get_mut(*frame) {
                     erase(&mut f.image, mask);
+                }
+            }
+            EditOp::Draw(drawing) => {
+                // Frames of one size (animations) share one rasterized layer.
+                let mut ink: Option<((u32, u32), Vec<u8>)> = None;
+                for f in &mut img.frames {
+                    let size = (f.image.width(), f.image.height());
+                    if ink.as_ref().is_none_or(|(s, _)| *s != size) {
+                        ink = Some((size, rasterize(drawing, size.0, size.1)));
+                    }
+                    if let Some((_, layer)) = &ink {
+                        draw(&mut f.image, layer);
+                    }
+                }
+            }
+            EditOp::Text(captions) => {
+                let mut ink: Option<((u32, u32), Vec<u8>)> = None;
+                for f in &mut img.frames {
+                    let size = (f.image.width(), f.image.height());
+                    if ink.as_ref().is_none_or(|(s, _)| *s != size) {
+                        ink = Some((size, crate::caption::layer(captions, size.0, size.1)));
+                    }
+                    if let Some((_, layer)) = &ink {
+                        draw(&mut f.image, layer);
+                    }
                 }
             }
             EditOp::Crop(region) => {
@@ -54,6 +80,109 @@ fn erase(image: &mut DynamicImage, mask: &Mask) {
         ImageRgba32F(b) => scale_alpha(b, 4, &m, |a, k| a * k as f32 / 255.0),
         _ => unreachable!("converted to a type with alpha above"),
     }
+}
+
+/// The strokes as premultiplied RGBA at `w`×`h`, anti-aliased with round ends and joins.
+fn rasterize(drawing: &Drawing, w: u32, h: u32) -> Vec<u8> {
+    let Some(mut pixmap) = tiny_skia::Pixmap::new(w, h) else { return Vec::new() };
+    let (sx, sy) = (w as f32 / drawing.of_width.max(1) as f32, h as f32 / drawing.of_height.max(1) as f32);
+    let transform = tiny_skia::Transform::from_scale(sx, sy);
+    for stroke in &drawing.strokes {
+        let mut paint = tiny_skia::Paint::default();
+        let [r, g, b, a] = stroke.color;
+        paint.set_color_rgba8(r, g, b, a);
+        paint.anti_alias = true;
+        let Some(&(x0, y0)) = stroke.points.first() else { continue };
+        if stroke.points.len() == 1 {
+            if let Some(dot) = tiny_skia::PathBuilder::from_circle(x0, y0, stroke.width / 2.0) {
+                pixmap.fill_path(&dot, &paint, tiny_skia::FillRule::Winding, transform, None);
+            }
+            continue;
+        }
+        let mut path = tiny_skia::PathBuilder::new();
+        path.move_to(x0, y0);
+        for &(x, y) in &stroke.points[1..] {
+            path.line_to(x, y);
+        }
+        let Some(path) = path.finish() else { continue };
+        let pen = tiny_skia::Stroke {
+            width: stroke.width,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, &paint, &pen, transform, None);
+    }
+    pixmap.take()
+}
+
+/// Paint a premultiplied RGBA layer over the image. Opaque images stay opaque (so formats
+/// without transparency don't report any); grey images become colour.
+fn draw(image: &mut DynamicImage, layer: &[u8]) {
+    if layer.len() != image.width() as usize * image.height() as usize * 4 {
+        return;
+    }
+    let colour = match std::mem::take(image) {
+        img @ (ImageRgb8(_) | ImageRgba8(_) | ImageRgb16(_) | ImageRgba16(_) | ImageRgb32F(_) | ImageRgba32F(_)) => img,
+        ImageLuma8(b) => ImageRgb8(DynamicImage::ImageLuma8(b).to_rgb8()),
+        ImageLuma16(b) => ImageRgb16(DynamicImage::ImageLuma16(b).to_rgb16()),
+        ImageLumaA16(b) => ImageRgba16(DynamicImage::ImageLumaA16(b).to_rgba16()),
+        other => ImageRgba8(other.to_rgba8()),
+    };
+    *image = colour;
+    let (u8_in, u8_out) = (|v: u8| v as f32 / 255.0, |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let (u16_in, u16_out) = (|v: u16| v as f32 / 65535.0, |v: f32| (v.clamp(0.0, 1.0) * 65535.0).round() as u16);
+    match image {
+        ImageRgb8(b) => blend(b, 3, layer, false, u8_in, u8_out),
+        ImageRgba8(b) => blend(b, 4, layer, false, u8_in, u8_out),
+        ImageRgb16(b) => blend(b, 3, layer, false, u16_in, u16_out),
+        ImageRgba16(b) => blend(b, 4, layer, false, u16_in, u16_out),
+        // Float pixels are linear light, so the sRGB ink is converted first.
+        ImageRgb32F(b) => blend(b, 3, layer, true, |v| v, |v| v),
+        ImageRgba32F(b) => blend(b, 4, layer, true, |v| v, |v| v),
+        _ => unreachable!("converted to a colour type above"),
+    }
+}
+
+/// Source-over compositing of premultiplied `layer` onto straight-alpha pixels.
+fn blend<T: Copy>(pixels: &mut [T], channels: usize, layer: &[u8], linear: bool, get: impl Fn(T) -> f32, put: impl Fn(f32) -> T) {
+    for (px, ink) in pixels.chunks_exact_mut(channels).zip(layer.as_chunks::<4>().0) {
+        if ink[3] == 0 {
+            continue;
+        }
+        let sa = ink[3] as f32 / 255.0;
+        let da = if channels == 4 { get(px[3]) } else { 1.0 };
+        let out_a = sa + da * (1.0 - sa);
+        for c in 0..3 {
+            let mut sc = ink[c] as f32 / 255.0 / sa;
+            if linear {
+                sc = crate::color::srgb_to_linear(sc);
+            }
+            px[c] = put((sc * sa + get(px[c]) * da * (1.0 - sa)) / out_a);
+        }
+        if channels == 4 {
+            px[3] = put(out_a);
+        }
+    }
+}
+
+/// Draw the strokes onto an 8-bit image (the editor's preview).
+pub fn draw_rgba(img: &mut RgbaImage, drawing: &Drawing) {
+    if drawing.strokes.is_empty() {
+        return;
+    }
+    let layer = rasterize(drawing, img.width(), img.height());
+    blend_rgba(img, &layer);
+}
+
+/// Write the captions onto an 8-bit image (the editor's thumbnail).
+pub fn captions_rgba(img: &mut RgbaImage, captions: &Captions) {
+    let layer = crate::caption::layer(captions, img.width(), img.height());
+    blend_rgba(img, &layer);
+}
+
+fn blend_rgba(img: &mut RgbaImage, layer: &[u8]) {
+    blend(img, 4, layer, false, |v: u8| v as f32 / 255.0, |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
 }
 
 fn scale_alpha<T: Copy>(pixels: &mut [T], channels: usize, mask: &[u8], f: impl Fn(T, u8) -> T) {
@@ -214,23 +343,42 @@ fn blur_line(src: &[u8], src_stride: usize, dst: &mut [u8], dst_stride: usize, l
     }
 }
 
-/// Decode the first image of `path` as 8-bit sRGB for the editor, scaled down to at most
-/// `max_side` pixels wide and high, along with its full size. Float (HDR) sources are
-/// tone-mapped the same way as when they're converted to an 8-bit format.
-pub fn decode_for_edit(path: &Path, from: Format, options: &Options, max_side: u32) -> Result<(RgbaImage, (u32, u32))> {
+/// Every image in `path` (animation frames, pages) as 8-bit sRGB for the editor, along with
+/// the first image's full size. All are scaled to one working size: at most `max_side` wide
+/// and high, and small enough that all of them together hold at most `max_pixels` pixels.
+/// Float (HDR) sources are tone-mapped the same way as when converted to an 8-bit format.
+pub fn decode_for_edit(
+    path: &Path,
+    from: Format,
+    options: &Options,
+    max_side: u32,
+    max_pixels: u64,
+) -> Result<(Vec<RgbaImage>, (u32, u32))> {
     let converter = crate::ImageConverter::default();
     let decoder = converter.decoders.iter().find(|d| d.format() == from).ok_or(Error::NoRoute { from, to: from })?;
     let (cancel, progress) = (AtomicBool::new(false), |_: f32| {});
     let ctx = ConvertCtx::new(options, &cancel, &progress);
-    let img = decoder.decode(path, 1, &ctx)?;
-    let img = crate::color::for_encoder(img, false, from, options).first().to_rgba8();
-    let (w, h) = img.dimensions();
-    if w.max(h) <= max_side {
-        return Ok((img, (w, h)));
-    }
-    let scale = max_side as f32 / w.max(h) as f32;
-    let (nw, nh) = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
-    Ok((image::imageops::resize(&img, nw, nh, FilterType::Triangle), (w, h)))
+    let img = decoder.decode(path, usize::MAX, &ctx)?;
+    // Load caption fonts now, in the background, rather than on the first caption.
+    crate::caption::fonts();
+    let img = crate::color::for_encoder(img, false, from, options);
+    let (w, h) = (img.first().width(), img.first().height());
+    let n = img.frames.len() as f64;
+    let scale = (max_side as f64 / w.max(h) as f64)
+        .min((max_pixels as f64 / (n * w as f64 * h as f64)).sqrt())
+        .min(1.0);
+    let (nw, nh) = (((w as f64 * scale).round() as u32).max(1), ((h as f64 * scale).round() as u32).max(1));
+    // Pages of other sizes (TIFF pages, icon sizes) are stretched to the same working size;
+    // their edits are stretched back when converting.
+    let frames = img
+        .frames
+        .iter()
+        .map(|f| {
+            let rgba = f.image.to_rgba8();
+            if rgba.dimensions() == (nw, nh) { rgba } else { image::imageops::resize(&rgba, nw, nh, FilterType::Triangle) }
+        })
+        .collect();
+    Ok((frames, (w, h)))
 }
 
 /// `mask` stretched to `w`×`h`.
@@ -336,6 +484,71 @@ mod tests {
         let out = deep.first().as_rgba16().expect("16-bit kept");
         assert_eq!(out.get_pixel(0, 0).0[3], 0);
         assert_eq!(out.get_pixel(1, 0).0[3], 32896);
+    }
+
+    fn line(color: [u8; 4]) -> Drawing {
+        // A 2-px horizontal line across the middle of a 10x10 working copy.
+        let stroke = transformer_core::Stroke { points: vec![(0.0, 5.0), (10.0, 5.0)], width: 2.0, color };
+        Drawing { strokes: vec![stroke], of_width: 10, of_height: 10 }
+    }
+
+    #[test]
+    fn strokes_are_drawn_scaled_and_keep_opaque_images_opaque() {
+        let mut img = ImageData::still(ImageRgb8(image::RgbImage::from_pixel(20, 20, image::Rgb([255, 255, 255]))));
+        apply(&mut img, &Edits { ops: vec![EditOp::Draw(line([255, 0, 0, 255]))] });
+        let out = img.first().as_rgb8().expect("still RGB, no alpha added");
+        assert_eq!(out.get_pixel(10, 9).0, [255, 0, 0], "line scaled to 4 px around y=10");
+        assert_eq!(out.get_pixel(10, 2).0, [255, 255, 255]);
+
+        // Grey becomes colour; a dot is a filled circle.
+        let mut grey = ImageData::still(ImageLuma8(image::GrayImage::from_pixel(10, 10, image::Luma([0]))));
+        let dot = transformer_core::Stroke { points: vec![(5.0, 5.0)], width: 4.0, color: [0, 255, 0, 255] };
+        apply(&mut grey, &Edits { ops: vec![EditOp::Draw(Drawing { strokes: vec![dot], of_width: 10, of_height: 10 })] });
+        let out = grey.first().as_rgb8().expect("colour");
+        assert_eq!(out.get_pixel(5, 5).0, [0, 255, 0]);
+        assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn ink_covers_erased_pixels_and_float_ink_is_linear() {
+        let mut img = ImageData::still(ImageRgba8(RgbaImage::from_pixel(10, 10, Rgba([0, 0, 255, 255]))));
+        let erase = EditOp::Erase { frame: 0, mask: Mask::new(10, 10, vec![0; 100]) };
+        apply(&mut img, &Edits { ops: vec![erase, EditOp::Draw(line([255, 255, 0, 255]))] });
+        let out = img.first().as_rgba8().unwrap();
+        assert_eq!(out.get_pixel(5, 5).0, [255, 255, 0, 255], "ink is opaque over transparency");
+        assert_eq!(out.get_pixel(5, 0).0[3], 0);
+
+        let mut hdr = ImageData::still(ImageRgb32F(image::Rgb32FImage::from_pixel(10, 10, image::Rgb([4.0, 4.0, 4.0]))));
+        apply(&mut hdr, &Edits { ops: vec![EditOp::Draw(line([128, 0, 0, 255]))] });
+        let p = hdr.first().as_rgb32f().unwrap().get_pixel(5, 5).0;
+        assert!((p[0] - crate::color::srgb_to_linear(128.0 / 255.0)).abs() < 1e-3 && p[1] == 0.0, "{p:?}");
+        assert_eq!(hdr.first().as_rgb32f().unwrap().get_pixel(5, 0).0, [4.0; 3], "HDR values untouched elsewhere");
+    }
+
+    #[test]
+    fn captions_are_written_on_every_frame_and_cropped_after() {
+        let mut img = ImageData::still(ImageRgb8(image::RgbImage::from_pixel(40, 40, image::Rgb([30, 60, 90]))));
+        img.frames.push(crate::Frame { image: ImageRgb8(image::RgbImage::from_pixel(40, 40, image::Rgb([30, 60, 90]))), delay: Default::default() });
+        let caption = transformer_core::Caption {
+            text: "I".into(),
+            x: 10.0,
+            y: 10.0,
+            size: 12.0,
+            font: transformer_core::CaptionFont::Meme,
+            uppercase: true,
+            fill: [255, 255, 0, 255],
+            outline: [0, 0, 0, 255],
+            outline_width: 0.0,
+        };
+        let captions = Captions { items: vec![caption], of_width: 20, of_height: 20 };
+        let crop = Region { x: 0, y: 0, width: 10, height: 20, of_width: 20, of_height: 20 };
+        apply(&mut img, &Edits { ops: vec![EditOp::Text(captions), EditOp::Crop(crop)] });
+        for f in &img.frames {
+            let out = f.image.as_rgb8().expect("opaque stays RGB");
+            assert_eq!(out.dimensions(), (20, 40));
+            // The caption sat at x = 20 of 40; after cropping to the left half it's at the edge.
+            assert!((0..40).any(|y| out.get_pixel(19, y).0 == [255, 255, 0]), "yellow text on each frame");
+        }
     }
 
     #[test]

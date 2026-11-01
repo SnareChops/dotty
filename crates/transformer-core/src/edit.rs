@@ -17,8 +17,13 @@ impl Edits {
 
     /// The erase mask for the first image, if any.
     pub fn mask(&self) -> Option<&Mask> {
+        self.frame_mask(0)
+    }
+
+    /// The erase mask for image `frame` (an animation frame or page), if any.
+    pub fn frame_mask(&self, frame: usize) -> Option<&Mask> {
         self.ops.iter().find_map(|op| match op {
-            EditOp::Erase { frame: 0, mask } => Some(mask),
+            EditOp::Erase { frame: f, mask } if *f == frame => Some(mask),
             _ => None,
         })
     }
@@ -26,6 +31,20 @@ impl Edits {
     pub fn crop(&self) -> Option<Region> {
         self.ops.iter().find_map(|op| match op {
             EditOp::Crop(r) => Some(*r),
+            _ => None,
+        })
+    }
+
+    pub fn drawing(&self) -> Option<&Drawing> {
+        self.ops.iter().find_map(|op| match op {
+            EditOp::Draw(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    pub fn captions(&self) -> Option<&Captions> {
+        self.ops.iter().find_map(|op| match op {
+            EditOp::Text(c) => Some(c),
             _ => None,
         })
     }
@@ -40,8 +59,66 @@ impl Edits {
 pub enum EditOp {
     /// Multiply the alpha of image `frame` by `mask` (makes parts of it transparent).
     Erase { frame: usize, mask: Mask },
+    /// Draw pen strokes over every image (before cropping, so they line up with the picture).
+    Draw(Drawing),
+    /// Write captions over every image (after drawing, before cropping).
+    Text(Captions),
     /// Keep only this part of every image (animation frames are cropped alike).
     Crop(Region),
+}
+
+/// Captions placed on an image `of_width`×`of_height` (the editor's working size); scaled
+/// to the size the image decodes at and rendered there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Captions {
+    pub items: Vec<Caption>,
+    pub of_width: u32,
+    pub of_height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Caption {
+    /// May hold several lines; they are centred on each other.
+    pub text: String,
+    /// Centre of the text, in working-size pixels.
+    pub x: f32,
+    pub y: f32,
+    /// Font size in working-size pixels.
+    pub size: f32,
+    pub font: CaptionFont,
+    pub uppercase: bool,
+    /// sRGB colours with straight alpha.
+    pub fill: [u8; 4],
+    pub outline: [u8; 4],
+    /// Outline thickness as a fraction of the font size (0 for none).
+    pub outline_width: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaptionFont {
+    /// The bold condensed meme look (Anton, bundled so it looks the same everywhere).
+    Meme,
+    /// The system's bold sans-serif.
+    Sans,
+}
+
+/// Pen strokes drawn on an image `of_width`×`of_height` (the editor's working size); scaled
+/// to the size the image actually decodes at and rasterized there, so lines stay crisp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Drawing {
+    pub strokes: Vec<Stroke>,
+    pub of_width: u32,
+    pub of_height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stroke {
+    /// The pen's path in working-size pixels; a single point is a dot.
+    pub points: Vec<(f32, f32)>,
+    /// Line width in working-size pixels.
+    pub width: f32,
+    /// sRGB colour with straight (not premultiplied) alpha.
+    pub color: [u8; 4],
 }
 
 /// A rectangle picked on an image `of_width`×`of_height` (the editor's working size). It is

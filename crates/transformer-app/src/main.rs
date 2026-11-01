@@ -67,9 +67,8 @@ struct Entry {
 }
 
 impl Entry {
-    /// The editor works on still images; animations and pages come later.
     fn editable_image(&self) -> bool {
-        self.from.kind() == Kind::Image && !self.multi
+        self.from.kind() == Kind::Image
     }
 
     /// Whether the edits made parts of the image transparent.
@@ -439,12 +438,9 @@ impl App {
                             });
                         }
                         let label = if e.edits.is_some() { "Edit •" } else { "Edit" };
-                        if ui.add_enabled(editable, egui::Button::new(label)).on_hover_text("Crop or remove the background before converting").clicked() {
+                        if ui.add_enabled(editable, egui::Button::new(label)).on_hover_text("Remove the background, draw, add text or crop before converting").clicked() {
                             edit = Some(i);
                         }
-                    } else if e.from.kind() == Kind::Image {
-                        ui.add_enabled(false, egui::Button::new("Edit"))
-                            .on_disabled_hover_text("Editing animations and multi-page images isn't supported yet");
                     }
                     if e.to.is_some() && e.status.pending() && ui.button("Go").on_hover_text("Convert this file").clicked() {
                         go = Some(i);
@@ -857,7 +853,7 @@ mod tests {
     }
 
     fn image_size(path: &std::path::Path) -> (u32, u32) {
-        let (_, size) = codecs_image::edit::decode_for_edit(path, Format::Png, &Options::default(), u32::MAX).unwrap();
+        let (_, size) = codecs_image::edit::decode_for_edit(path, Format::Png, &Options::default(), u32::MAX, u64::MAX).unwrap();
         size
     }
 }
