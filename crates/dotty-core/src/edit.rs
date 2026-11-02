@@ -49,6 +49,14 @@ impl Edits {
         })
     }
 
+    /// The video edits, if any.
+    pub fn video(&self) -> Option<&VideoEdits> {
+        self.ops.iter().find_map(|op| match op {
+            EditOp::Video(v) => Some(v),
+            _ => None,
+        })
+    }
+
     /// Which part of a video becomes images, if picked.
     pub fn frames(&self) -> Option<&FrameSelection> {
         self.ops.iter().find_map(|op| match op {
@@ -86,6 +94,140 @@ pub enum EditOp {
     /// The frame (or range of frames) of a video that becomes an image. Image edits after
     /// it apply to those frames, in order.
     Frames(FrameSelection),
+    /// Trim, crop, rotate, speed, fades, text and sound changes to a video.
+    Video(VideoEdits),
+}
+
+/// Changes to a video, applied in this order: trim → rotate/flip → crop → resize (picture);
+/// speed, frame rate, fades and text overlays (time). The soundtrack follows (trim, speed
+/// with pitch kept, fades, volume).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoEdits {
+    /// Keep from here to there (seconds into the source); `None` = to the end.
+    pub trim_start: f64,
+    pub trim_end: Option<f64>,
+    /// Extra clockwise rotation (0, 90, 180, 270), on top of the file's own.
+    pub rotate: u16,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    /// Keep only this part of the (rotated) picture; the region's coordinates are on a frame
+    /// of `of_width`×`of_height`.
+    pub crop: Option<Region>,
+    /// Longest side of the result in pixels (never enlarges).
+    pub max_side: Option<u32>,
+    pub speed: f64,
+    /// Frames per second of the result (never above the source's).
+    pub fps: Option<f32>,
+    /// Fade from and to black (and silence), in seconds of the result.
+    pub fade_in: f64,
+    pub fade_out: f64,
+    pub texts: Vec<VideoText>,
+    /// Drop the sound.
+    pub mute: bool,
+    pub volume_db: f32,
+    /// Which audio track (`None` = the default).
+    pub track: Option<u32>,
+    /// Use this audio file as the sound instead (for a picture made into a video, or to
+    /// replace a video's own).
+    pub audio_file: Option<std::path::PathBuf>,
+    /// The part of `audio_file` used (seconds into it); the end `None` = to its end, or as
+    /// far as the video goes. For a picture the part's length is the video's.
+    pub audio_start: f64,
+    pub audio_end: Option<f64>,
+    /// How long a picture lasts as a video when it has no sound (`None` = 5 s).
+    pub still_secs: Option<f64>,
+    /// The picture a song is shown with (instead of its cover art), for audio → video.
+    pub picture_file: Option<std::path::PathBuf>,
+}
+
+impl Default for VideoEdits {
+    fn default() -> Self {
+        Self {
+            trim_start: 0.0,
+            trim_end: None,
+            rotate: 0,
+            flip_h: false,
+            flip_v: false,
+            crop: None,
+            max_side: None,
+            speed: 1.0,
+            fps: None,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            texts: Vec::new(),
+            mute: false,
+            volume_db: 0.0,
+            track: None,
+            audio_file: None,
+            audio_start: 0.0,
+            audio_end: None,
+            still_secs: None,
+            picture_file: None,
+        }
+    }
+}
+
+/// A caption on the picture for part of the result's time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoText {
+    /// Position (centre) and size are in pixels of a result frame `of_width`×`of_height`.
+    pub caption: Caption,
+    pub of_width: u32,
+    pub of_height: u32,
+    /// Seconds of the result.
+    pub start: f64,
+    pub end: Option<f64>,
+}
+
+impl VideoEdits {
+    pub const MIN_SPEED: f64 = 0.15;
+    pub const MAX_SPEED: f64 = 4.0;
+
+    /// Whether these change nothing.
+    pub fn is_noop(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Turn the picture a quarter as it appears (clockwise or not), whatever flips are on:
+    /// rotation is applied before flips, so with a flip on, a turn in the picture's own terms
+    /// is the opposite turn on screen, which swapping the two flips cancels out. The crop box
+    /// stays around the same part of the picture.
+    pub fn turn_view(&mut self, clockwise: bool) {
+        self.rotate = (self.rotate + if clockwise { 90 } else { 270 }) % 360;
+        std::mem::swap(&mut self.flip_h, &mut self.flip_v);
+        self.crop = self.crop.map(|c| if clockwise { c.rotated_cw() } else { c.rotated_ccw() });
+    }
+
+    /// Mirror the picture as it appears, with the crop box.
+    pub fn flip_view(&mut self, horizontal: bool) {
+        if horizontal {
+            self.flip_h = !self.flip_h;
+            self.crop = self.crop.map(|c| c.flipped_h());
+        } else {
+            self.flip_v = !self.flip_v;
+            self.crop = self.crop.map(|c| c.flipped_v());
+        }
+    }
+
+    /// Whether the picture itself changes (rather than only which frames are kept, and when).
+    pub fn changes_picture(&self) -> bool {
+        !self.rotate.is_multiple_of(360) || self.flip_h || self.flip_v || self.crop.is_some() || self.max_side.is_some() || self.fade_in > 0.0 || self.fade_out > 0.0 || !self.texts.is_empty()
+    }
+
+    /// The sound edits that go with these.
+    pub fn audio(&self) -> AudioEdits {
+        AudioEdits {
+            track: self.track,
+            trim_start: self.trim_start,
+            trim_end: self.trim_end,
+            speed: self.speed.clamp(AudioEdits::MIN_SPEED, AudioEdits::MAX_SPEED),
+            keep_pitch: true,
+            fade_in: self.fade_in,
+            fade_out: self.fade_out,
+            volume: Volume::Gain(self.volume_db),
+            ..Default::default()
+        }
+    }
 }
 
 /// Which part of a video becomes images. Unset fields take the defaults for the target.
@@ -336,6 +478,26 @@ pub struct Region {
 }
 
 impl Region {
+    /// The same part of the picture after the picture is turned a quarter clockwise.
+    pub fn rotated_cw(&self) -> Self {
+        Self { x: self.of_height - self.y - self.height, y: self.x, width: self.height, height: self.width, of_width: self.of_height, of_height: self.of_width }
+    }
+
+    /// The same part of the picture after it is turned a quarter counter-clockwise.
+    pub fn rotated_ccw(&self) -> Self {
+        Self { x: self.y, y: self.of_width - self.x - self.width, width: self.height, height: self.width, of_width: self.of_height, of_height: self.of_width }
+    }
+
+    /// The same part of the picture after it is mirrored left to right.
+    pub fn flipped_h(&self) -> Self {
+        Self { x: self.of_width - self.x - self.width, ..*self }
+    }
+
+    /// The same part of the picture after it is mirrored top to bottom.
+    pub fn flipped_v(&self) -> Self {
+        Self { y: self.of_height - self.y - self.height, ..*self }
+    }
+
     /// `(x, y, width, height)` on an image `w`×`h`, at least one pixel and inside it.
     pub fn scaled(&self, w: u32, h: u32) -> (u32, u32, u32, u32) {
         let scale = |v: u32, of: u32, to: u32| ((v as u64 * to as u64 + of as u64 / 2) / of.max(1) as u64) as u32;
@@ -383,6 +545,17 @@ impl fmt::Debug for Mask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regions_follow_their_part_of_the_picture_through_turns_and_flips() {
+        let r = Region { x: 10, y: 20, width: 30, height: 40, of_width: 100, of_height: 200 };
+        let cw = r.rotated_cw();
+        assert_eq!((cw.x, cw.y, cw.width, cw.height, cw.of_width, cw.of_height), (140, 10, 40, 30, 200, 100));
+        assert_eq!(cw.rotated_ccw(), r, "a turn and its undoing");
+        assert_eq!(r.rotated_cw().rotated_cw().rotated_cw().rotated_cw(), r, "four quarters");
+        assert_eq!(r.flipped_h().flipped_h(), r);
+        assert_eq!((r.flipped_h().x, r.flipped_v().y), (60, 140));
+    }
 
     #[test]
     fn region_scales_and_stays_inside() {

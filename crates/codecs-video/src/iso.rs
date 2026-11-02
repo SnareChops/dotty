@@ -21,6 +21,8 @@ pub struct IsoVideo {
     pub height: u32,
     /// The track's ID, to match symphonia's track.
     pub track_id: u32,
+    /// File offset of the `av1C`/`vpcC` payload (to patch it), when there is one.
+    pub config_at: u64,
 }
 
 fn read<const N: usize>(r: &mut impl Read) -> Option<[u8; N]> {
@@ -126,12 +128,31 @@ pub fn video_track(path: &Path) -> Option<IsoVideo> {
                 let mut buf = vec![0u8; (ce - cs) as usize];
                 r.read_exact(&mut buf).ok()?;
                 v.config = buf;
+                v.config_at = cs;
             }
         }
         found = Some(v);
         Some(())
     })?;
     found
+}
+
+/// Whether the matrix tagged for a picture `height` lines tall is BT.709 (else BT.601): what
+/// our encoder converts with, and what players assume when nothing is tagged.
+pub fn uses_709(height: u32) -> bool {
+    height >= 720
+}
+
+/// `muxide` tags VP9 in MP4 with a transfer of 0 ("reserved") and an identity matrix, which
+/// players read as RGB-in-YUV. Write the colour description we actually encode with.
+pub fn fix_vp9_colour(path: &Path) -> std::io::Result<()> {
+    let Some(v) = video_track(path).filter(|v| &v.fourcc == b"vp09" && v.config_at > 0) else { return Ok(()) };
+    // vpcC (a full box): version/flags (4), profile, level, bit depth/chroma/range, then
+    // primaries, transfer, matrix.
+    let (p, t, m) = if uses_709(v.height) { (1, 1, 1) } else { (6, 6, 6) };
+    let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(v.config_at + 7))?;
+    std::io::Write::write_all(&mut f, &[p, t, m])
 }
 
 #[cfg(test)]

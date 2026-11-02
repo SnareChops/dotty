@@ -1,7 +1,7 @@
 //! Video → images: one frame as a still, or a range of frames as an animation or a folder
 //! of images, handed to the image pipeline (which also applies image-editor edits).
 
-use crate::{VideoReader, rotate};
+use crate::{VideoReader, output, rotate};
 use codecs_image::{Frame, ImageConverter, ImageData};
 use dotty_core::{Choice, ConvertCtx, Converter, Error, Format, FrameSelection, Kind, Result};
 use image::DynamicImage;
@@ -107,20 +107,46 @@ fn scale(img: DynamicImage, w: u32, h: u32) -> DynamicImage {
 }
 
 impl Converter for VideoConverter {
+    /// Videos → pictures and → videos; pictures and sound → videos.
     fn routes(&self) -> Vec<(Format, Format)> {
-        let targets: Vec<Format> = Format::ALL
+        let pictures: Vec<Format> = Format::ALL
             .into_iter()
             .filter(|&t| t.kind() == Kind::Image && self.images.routes().iter().any(|r| r.1 == t))
             .collect();
-        VIDEO_FORMATS.iter().flat_map(|&f| targets.iter().map(move |&t| (f, t))).collect()
+        let mut routes: Vec<(Format, Format)> = VIDEO_FORMATS.iter().flat_map(|&f| pictures.iter().map(move |&t| (f, t))).collect();
+        let sources = VIDEO_FORMATS
+            .into_iter()
+            .chain(self.images.readable())
+            .chain(codecs_audio::AudioConverter::default().readable().into_iter().filter(|f| f.kind() == Kind::Audio));
+        for f in sources {
+            routes.extend(output::VIDEO_OUTPUTS.iter().map(|&t| (f, t)));
+        }
+        routes
     }
 
     fn choices(&self, to: Format) -> Vec<Choice> {
-        self.images.choices(to)
+        if output::VIDEO_OUTPUTS.contains(&to) { vec![output::VIDEO_CODEC] } else { self.images.choices(to) }
     }
 
     fn convert(&self, src: &Path, dst: &Path, from: Format, to: Format, ctx: &ConvertCtx) -> Result<()> {
         (ctx.progress)(0.0);
+        if output::VIDEO_OUTPUTS.contains(&to) {
+            let file = std::fs::File::create(dst).map_err(|source| Error::Io { path: dst.into(), source })?;
+            let mut out = std::io::BufWriter::new(file);
+            match from.kind() {
+                Kind::Video => output::from_video(src, from, ctx, &mut out, to)?,
+                Kind::Image => output::from_image(src, from, ctx, &mut out, to)?,
+                Kind::Audio => output::from_audio(src, from, ctx, &mut out, to)?,
+            }
+            use std::io::Write;
+            out.flush().map_err(|source| Error::Io { path: dst.into(), source })?;
+            drop(out);
+            if to == Format::Mp4 {
+                crate::iso::fix_vp9_colour(dst).map_err(|source| Error::Io { path: dst.into(), source })?;
+            }
+            (ctx.progress)(1.0);
+            return Ok(());
+        }
         let sel = ctx.edits.and_then(|e| e.frames()).copied().unwrap_or_default();
         let img = video_frames(src, from, to, &sel, ctx)?;
         ctx.check_cancelled()?;

@@ -11,14 +11,14 @@ pub mod edit;
 mod flac;
 mod id3;
 mod mp3;
-mod opus;
+pub mod opus;
 mod resample;
 mod stages;
 mod tags;
 mod vorbis;
 mod wav;
 
-pub use decode::{OggOpusDecoder, SymphoniaDecoder};
+pub use decode::{OggOpusDecoder, SymphoniaDecoder, cover_art};
 pub use tags::Tags;
 
 use stages::{Metered, Remix, Resample};
@@ -232,6 +232,11 @@ impl AudioConverter {
         self.open_track(path, from, None)
     }
 
+    /// Formats this converter reads.
+    pub fn readable(&self) -> Vec<Format> {
+        self.decoders.iter().map(|d| d.format()).collect()
+    }
+
     /// Open audio track `track` (`None` = the default one).
     pub fn open_track(&self, path: &Path, from: Format, track: Option<u32>) -> Result<Box<dyn AudioSource>> {
         let d = self.decoders.iter().find(|d| d.format() == from).ok_or(Error::UnknownFormat)?;
@@ -239,6 +244,40 @@ impl AudioConverter {
             Some(t) => d.open_track(path, t),
             None => d.open(path),
         }
+    }
+
+    /// A file's sound as Opus packets for a video (mixed to at most stereo, at 48 kHz), with
+    /// the editor's audio edits if any. `track` picks an audio track (`None` = the default).
+    pub fn soundtrack(&self, path: &Path, from: Format, track: Option<u32>, ctx: &ConvertCtx) -> Result<opus::OpusPackets> {
+        self.soundtrack_with(path, from, track, ctx.edits.and_then(|e| e.audio()).copied(), ctx)
+    }
+
+    /// [`AudioConverter::soundtrack`] with the audio edits given rather than taken from the job.
+    pub fn soundtrack_with(
+        &self,
+        path: &Path,
+        from: Format,
+        track: Option<u32>,
+        edits: Option<dotty_core::AudioEdits>,
+        ctx: &ConvertCtx,
+    ) -> Result<opus::OpusPackets> {
+        let mut decoded = self.open_track(path, from, track)?;
+        let info = decoded.info().clone();
+        let mut chain: Box<dyn AudioSource + '_> = Box::new(&mut decoded);
+        let normalizing = edits.is_some_and(|a| a.volume.measures());
+        let edits = edits.map(|a| a.without_noops(info.channels)).filter(|a| !a.is_noop());
+        if let Some(a) = edits {
+            // Normalizing would need a measuring pass; a video's sound is only ever scaled by gain.
+            debug_assert!(!normalizing);
+            chain = edit::apply(chain, &a, None)?;
+        }
+        if chain.info().channels > 2 || chain.info().channels == 0 {
+            chain = Box::new(Remix::new(chain, 2));
+        }
+        if chain.info().sample_rate != 48000 {
+            chain = Box::new(Resample::new(chain, 48000)?);
+        }
+        opus::encode_packets(&mut *chain, ctx.options.preset, ctx)
     }
 
     /// The file's audio tracks (empty when there's only ever one).

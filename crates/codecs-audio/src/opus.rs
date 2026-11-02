@@ -132,3 +132,76 @@ impl FrameSink {
         Ok(())
     }
 }
+
+/// A soundtrack encoded as Opus packets for a video container (Matroska/WebM, MP4), each
+/// 20 ms at 48 kHz.
+pub struct OpusPackets {
+    pub channels: u8,
+    /// Samples (at 48 kHz) the decoder drops at the start: the encoder's delay.
+    pub pre_skip: u16,
+    pub packets: Vec<Vec<u8>>,
+    /// Real samples (at 48 kHz), without the delay or the padding of the last packet.
+    pub samples: u64,
+}
+
+impl OpusPackets {
+    /// Seconds per packet.
+    pub const PACKET_SECS: f64 = 0.02;
+
+    /// The OpusHead (RFC 7845) Matroska/WebM carry as CodecPrivate.
+    pub fn head(&self) -> Vec<u8> {
+        let mut h = b"OpusHead".to_vec();
+        h.push(1);
+        h.push(self.channels);
+        h.extend_from_slice(&self.pre_skip.to_le_bytes());
+        h.extend_from_slice(&48000u32.to_le_bytes());
+        h.extend_from_slice(&0i16.to_le_bytes());
+        h.push(0);
+        h
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.samples as f64 / 48000.0
+    }
+}
+
+/// Encode a 48 kHz mono/stereo stream into [`OpusPackets`].
+pub fn encode_packets(src: &mut dyn AudioSource, preset: Preset, ctx: &ConvertCtx) -> Result<OpusPackets> {
+    let (rate, ch) = (src.info().sample_rate, src.info().channels as usize);
+    if rate != 48000 || !(1..=2).contains(&ch) {
+        return Err(Error::Codec("opus: expected 48 kHz mono or stereo".into()));
+    }
+    let frame = 960;
+    let mut enc = OpusEncoder::new(48000, ch, Application::Audio).map_err(codec)?;
+    enc.bitrate_bps = bitrate_per_channel(preset) * ch as i32;
+    enc.rate_control = RateControl::Vbr;
+    let pre_skip = OpusHead::for_encoder(&enc, 48000).pre_skip;
+    let mut out = OpusPackets { channels: ch as u8, pre_skip, packets: Vec::new(), samples: 0 };
+    let mut packet = vec![0u8; MAX_PACKET_BYTES];
+    let mut buf: Vec<f32> = Vec::new();
+    let mut encode_whole = |buf: &mut Vec<f32>, out: &mut OpusPackets| -> Result<()> {
+        let per = frame * ch;
+        let mut used = 0;
+        while buf.len() - used >= per {
+            let n = enc.encode(&buf[used..used + per], frame, &mut packet).map_err(codec)?;
+            out.packets.push(packet[..n].to_vec());
+            used += per;
+        }
+        buf.drain(..used);
+        Ok(())
+    };
+    while let Some(chunk) = src.next_chunk()? {
+        ctx.check_cancelled()?;
+        out.samples += (chunk.len() / ch) as u64;
+        buf.extend_from_slice(chunk);
+        encode_whole(&mut buf, &mut out)?;
+    }
+    if out.samples == 0 {
+        return Err(Error::Codec("no audio samples to encode".into()));
+    }
+    // Flush the encoder's delay with silence, to whole frames.
+    let total = (out.samples as usize + pre_skip as usize).div_ceil(frame);
+    buf.resize((total - out.packets.len()) * frame * ch, 0.0);
+    encode_whole(&mut buf, &mut out)?;
+    Ok(out)
+}

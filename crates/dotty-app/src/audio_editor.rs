@@ -178,20 +178,20 @@ impl AudioEditor {
 
 /// Min/max of every channel's samples per block, at two block sizes, so the waveform can
 /// be drawn at any zoom without scanning the whole file each frame.
-struct Peaks {
+pub(crate) struct Peaks {
     small: Vec<(f32, f32)>,
     big: Vec<(f32, f32)>,
 }
 
 impl Peaks {
-    fn new(samples: &[f32], channels: usize) -> Self {
+    pub(crate) fn new(samples: &[f32], channels: usize) -> Self {
         let small: Vec<(f32, f32)> = samples.chunks(BLOCK * channels).map(|b| min_max(b.iter().copied())).collect();
         let big = small.chunks(BIG_BLOCK / BLOCK).map(|b| merge(b.iter().copied())).collect();
         Self { small, big }
     }
 
     /// Min and max over frames `a..b`, scanning `samples` for short spans.
-    fn range(&self, samples: &[f32], channels: usize, a: usize, b: usize) -> (f32, f32) {
+    pub(crate) fn range(&self, samples: &[f32], channels: usize, a: usize, b: usize) -> (f32, f32) {
         let b = b.max(a + 1);
         if b - a <= BLOCK * 2 {
             return scan(samples, channels, a, b);

@@ -249,6 +249,17 @@ impl Converter for ImageConverter {
 }
 
 impl ImageConverter {
+    /// Decode `path` as `from`, up to `max_frames` frames (videos made from images use this).
+    pub fn decode(&self, path: &Path, from: Format, max_frames: usize, ctx: &ConvertCtx) -> Result<ImageData> {
+        let decoder = self.decoders.iter().find(|d| d.format() == from).ok_or(Error::UnknownFormat)?;
+        decoder.decode(path, max_frames, ctx)
+    }
+
+    /// Formats this converter reads.
+    pub fn readable(&self) -> Vec<Format> {
+        self.decoders.iter().map(|d| d.format()).collect()
+    }
+
     /// Everything after decoding: metadata, editor edits, keeping or splitting several
     /// frames as `to` allows, colour handling, encoding. Videos hand their frames in here.
     pub fn write(&self, mut img: ImageData, from: Format, to: Format, dst: &Path, ctx: &ConvertCtx) -> Result<()> {

@@ -894,7 +894,10 @@ dependencies = [
  "dotty-core",
  "filmcraft-vp9",
  "image",
+ "muxide",
  "rav1d",
+ "rav1e",
+ "rusty_vp9",
  "symphonia",
 ]
 
@@ -2687,6 +2690,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
 dependencies = [
  "cfg-if",
+ "rayon",
 ]
 
 [[package]]
@@ -2751,6 +2755,18 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "muxide"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1dfe6cfed2ad65a109cc7e943056a043a290c4d6ad7faff05fdcbced93048fe5"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4224,6 +4240,12 @@ name = "rusty_mp3"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eda7c6c82285d2bc3f1e6aded40ca6f7572fe9eec77f18fb10efc1d03aed3877"
+
+[[package]]
+name = "rusty_vp9"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bf32821db20be4ea56ce1f8feb757bf55f146f2685ba98822c3bd2d43a33889"
 
 [[package]]
 name = "rusty_webp"

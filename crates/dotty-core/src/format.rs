@@ -134,7 +134,17 @@ impl Format {
     pub fn uses_quality(self) -> bool {
         matches!(
             self,
-            Format::Png | Format::Jpeg | Format::Gif | Format::Webp | Format::Avif | Format::Mp3 | Format::Ogg | Format::Opus
+            Format::Png
+                | Format::Jpeg
+                | Format::Gif
+                | Format::Webp
+                | Format::Avif
+                | Format::Mp3
+                | Format::Ogg
+                | Format::Opus
+                | Format::Mp4
+                | Format::Mkv
+                | Format::Webm
         )
     }
 

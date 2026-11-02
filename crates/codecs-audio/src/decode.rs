@@ -422,3 +422,24 @@ fn read_tags(format: &mut dyn FormatReader) -> Tags {
     }
     tags
 }
+
+/// The picture embedded in an audio file (the front cover if it says which), as encoded
+/// image bytes (usually JPEG or PNG).
+pub fn cover_art(path: &Path, from: Format) -> Option<Vec<u8>> {
+    let mut format = probe(path, from).ok()?;
+    let mut meta = format.metadata();
+    let mut found: Option<Vec<u8>> = None;
+    loop {
+        if let Some(rev) = meta.current() {
+            let front = rev.media.visuals.iter().find(|v| v.usage == Some(symphonia::core::meta::StandardVisualKey::FrontCover));
+            if let Some(v) = front.or(rev.media.visuals.first()) {
+                found = Some(v.data.to_vec());
+            }
+        }
+        if meta.is_latest() || found.is_some() {
+            break;
+        }
+        meta.pop();
+    }
+    found
+}

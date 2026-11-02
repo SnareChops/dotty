@@ -5,15 +5,14 @@
 
 use crate::audio_editor::{fmt_time, time_field};
 use codecs_video::convert::{default_side, plan_range, wants_range};
-use codecs_video::{VideoInfo, VideoReader};
+use codecs_video::VideoInfo;
 use dotty_core::{EditOp, Edits, Format, FrameSelection, JobId, Options};
 use eframe::egui;
 use codecs_video::image::{self, RgbImage};
+use crate::range_bar;
+use crate::video_worker::{Cmd, FrameQueue, Msg, Worker};
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
-
-/// Longest side of preview frames.
-const PREVIEW_SIDE: u32 = 960;
+use std::sync::Arc;
 
 pub enum Outcome {
     Open,
@@ -24,55 +23,12 @@ pub enum Outcome {
     EditPicture { sel: FrameSelection },
 }
 
-enum Msg {
-    Info(Result<VideoInfo, String>),
-    Frame(f64, RgbImage),
-    Failed(String),
-}
-
-/// A thread that owns the video and decodes the frames asked for, newest request first.
-struct Worker {
-    requests: mpsc::Sender<f64>,
-    replies: mpsc::Receiver<Msg>,
-}
-
-impl Worker {
-    fn start(ctx: &egui::Context, path: PathBuf, from: Format) -> Self {
-        let (req_tx, req_rx) = mpsc::channel::<f64>();
-        let (tx, replies) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let send = |m: Msg| {
-                let _ = tx.send(m);
-                ctx.request_repaint();
-            };
-            let mut reader = match VideoReader::open(&path, from, 4).and_then(|mut r| r.keyframes().map(|_| r)) {
-                Ok(r) => r,
-                Err(e) => return send(Msg::Info(Err(e.to_string()))),
-            };
-            send(Msg::Info(Ok(reader.info().clone())));
-            while let Ok(mut t) = req_rx.recv() {
-                // Only the latest request matters (the slider may have moved on).
-                while let Ok(newer) = req_rx.try_recv() {
-                    t = newer;
-                }
-                match reader.frame_at(t) {
-                    Ok(Some(img)) => {
-                        let img = if img.width().max(img.height()) > PREVIEW_SIDE {
-                            let k = PREVIEW_SIDE as f32 / img.width().max(img.height()) as f32;
-                            image::imageops::thumbnail(&img, (img.width() as f32 * k) as u32, (img.height() as f32 * k) as u32)
-                        } else {
-                            img
-                        };
-                        send(Msg::Frame(t, img));
-                    }
-                    Ok(None) => {}
-                    Err(e) => send(Msg::Failed(e.to_string())),
-                }
-            }
-        });
-        Self { requests: req_tx, replies }
-    }
+/// A playback in progress.
+struct Playing {
+    run: u64,
+    /// The video time it started at, and when.
+    t0: f64,
+    started: std::time::Instant,
 }
 
 pub struct FramePicker {
@@ -96,6 +52,15 @@ pub struct FramePicker {
     start_text: String,
     end_text: String,
     cursor_text: String,
+    // Playback: the animation (or video) in motion.
+    play: Option<Playing>,
+    run: u64,
+    queue: FrameQueue,
+    shown: Option<f64>,
+    /// The video's frames ran out during playback.
+    video_ended: bool,
+    /// The range handle being dragged on the timeline.
+    grab: Option<range_bar::Handle>,
 }
 
 impl FramePicker {
@@ -110,7 +75,7 @@ impl FramePicker {
             entry,
             title,
             to,
-            worker: Worker::start(ctx, path, from),
+            worker: Worker::start(ctx, path, from, None),
             info: None,
             error: None,
             sel,
@@ -123,7 +88,97 @@ impl FramePicker {
             start_text: String::new(),
             end_text: String::new(),
             cursor_text: String::new(),
+            play: None,
+            run: 0,
+            queue: FrameQueue::default(),
+            shown: None,
+            video_ended: false,
+            grab: None,
         }
+    }
+
+    fn playing(&self) -> bool {
+        self.play.is_some()
+    }
+
+    fn texture(&mut self, ctx: &egui::Context, t: f64, img: RgbImage) {
+        let color = egui::ColorImage::from_rgb([img.width() as usize, img.height() as usize], img.as_raw());
+        let tex = ctx.load_texture("frame-preview", color, egui::TextureOptions::LINEAR);
+        self.preview = Some((t, tex, img));
+    }
+
+    /// The part that plays: the range for an animation (looping), else the whole video.
+    fn play_bounds(&self) -> (f64, f64) {
+        match (self.range, self.plan()) {
+            (true, Some(p)) => (p.start, p.end),
+            _ => (0.0, self.duration()),
+        }
+    }
+
+    fn stop_play(&mut self) {
+        self.play = None;
+        self.queue.clear();
+        self.shown = None;
+        self.video_ended = false;
+        // Show the exact frame at the playhead again.
+        self.asked = None;
+    }
+
+    fn start_play(&mut self, t: f64) {
+        let (lo, hi) = self.play_bounds();
+        // Outside the part that plays (or at its very end): from its start.
+        let t = if t < lo || t >= hi - self.frame_step() { lo } else { t };
+        self.run += 1;
+        self.queue.clear();
+        self.shown = None;
+        self.video_ended = false;
+        self.cursor = t;
+        let _ = self.worker.requests.send(Cmd::Play(t, self.run, 1.0));
+        self.play = Some(Playing { run: self.run, t0: t, started: std::time::Instant::now() });
+    }
+
+    fn toggle_play(&mut self) {
+        if self.playing() {
+            self.stop_play();
+        } else {
+            self.start_play(self.cursor);
+        }
+    }
+
+    /// Show the frame due now. An animation plays at its own frame rate (so you see how
+    /// choppy it will be) and loops over its range; a single-frame pick plays on to the end.
+    fn update_playback(&mut self, ctx: &egui::Context) {
+        let Some(pb) = &self.play else { return };
+        let (run, t0, started) = (pb.run, pb.t0, pb.started);
+        while let Ok((r, pts, img)) = self.worker.play.try_recv() {
+            if r == run {
+                self.queue.push(pts, img);
+            }
+        }
+        let clock = t0 + started.elapsed().as_secs_f64();
+        let (lo, hi) = self.play_bounds();
+        if clock >= hi || (self.video_ended && self.queue.is_empty()) {
+            if self.range {
+                self.start_play(lo);
+            } else {
+                self.stop_play();
+            }
+            ctx.request_repaint();
+            return;
+        }
+        let shown_clock = match (self.range, self.plan()) {
+            (true, Some(p)) => lo + ((clock - lo) * p.fps as f64).floor() / p.fps as f64,
+            _ => clock,
+        };
+        if let Some((pts, img)) = self.queue.at(shown_clock)
+            && self.shown != Some(pts)
+        {
+            let img = img.clone();
+            self.shown = Some(pts);
+            self.texture(ctx, pts, img);
+        }
+        self.cursor = clock.clamp(0.0, self.duration());
+        ctx.request_repaint();
     }
 
     fn duration(&self) -> f64 {
@@ -142,18 +197,26 @@ impl FramePicker {
     pub fn show(&mut self, ctx: &egui::Context) -> Outcome {
         while let Ok(m) = self.worker.replies.try_recv() {
             match m {
-                Msg::Info(Ok(info)) => self.info = Some(info),
-                Msg::Info(Err(e)) | Msg::Failed(e) => self.error = Some(e),
-                Msg::Frame(t, img) => {
-                    let color = egui::ColorImage::from_rgb([img.width() as usize, img.height() as usize], img.as_raw());
-                    let tex = ctx.load_texture("frame-preview", color, egui::TextureOptions::LINEAR);
-                    self.preview = Some((t, tex, img));
+                Msg::Ready(Ok(r)) => self.info = r.video,
+                Msg::Ready(Err(e)) => self.error = Some(e),
+                Msg::Failed(e) => {
+                    self.stop_play();
+                    self.error = Some(e);
                 }
+                Msg::Frame(img) => {
+                    // A still asked for before playback began must not replace its frames.
+                    if self.play.is_none() {
+                        self.texture(ctx, self.asked.unwrap_or(self.cursor), img);
+                    }
+                }
+                Msg::Ended(run) => self.video_ended |= self.play.as_ref().is_some_and(|p| p.run == run),
+                Msg::Picture(..) => {}
             }
         }
-        if self.info.is_some() && self.asked != Some(self.cursor) {
+        self.update_playback(ctx);
+        if self.info.is_some() && self.play.is_none() && self.asked != Some(self.cursor) {
             self.asked = Some(self.cursor);
-            let _ = self.worker.requests.send(self.cursor);
+            let _ = self.worker.requests.send(Cmd::Seek(self.cursor));
         }
         let screen = ctx.content_rect();
         let size = (screen.size() - egui::vec2(48.0, 48.0)).max(egui::vec2(360.0, 300.0));
@@ -208,14 +271,20 @@ impl FramePicker {
             let shown = egui::Rect::from_center_size(rect.center(), s * k);
             ui.painter().image(tex.id(), shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         }
-        if self.preview.as_ref().is_none_or(|p| p.0 != self.cursor) {
+        if !self.playing() && self.preview.as_ref().is_none_or(|p| p.0 != self.cursor) {
             ui.painter().text(rect.right_top() + egui::vec2(-8.0, 8.0), egui::Align2::RIGHT_TOP, "…", egui::FontId::proportional(20.0), egui::Color32::WHITE);
         }
         ui.add_space(4.0);
 
-        // Timeline: the range in range mode, the playhead.
+        // Timeline: the range (with draggable diamonds) in range mode, and the playhead.
         let step = self.frame_step();
+        let cursor_before = self.cursor;
         ui.horizontal(|ui| {
+            let label = if self.playing() { "⏸ Pause" } else { "▶ Play" };
+            let tip = if self.range { "Play the animation as it will look (Space)" } else { "Play the video to find the frame (Space)" };
+            if ui.button(label).on_hover_text(tip).clicked() {
+                self.toggle_play();
+            }
             if ui.small_button("◀").on_hover_text("Previous frame (Left arrow)").clicked() {
                 self.cursor = (self.cursor - step).max(0.0);
             }
@@ -226,30 +295,34 @@ impl FramePicker {
                 self.cursor = t.clamp(0.0, duration);
             }
             ui.label(format!("/ {}", fmt_time(duration)));
+            let range = if self.range { self.plan().map(|p| (p.start, p.end)) } else { None };
             let width = ui.available_width();
-            let (bar, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click_and_drag());
-            let x = |t: f64| bar.left() + (t / duration.max(1e-9)) as f32 * bar.width();
-            let painter = ui.painter();
-            painter.rect_filled(bar.shrink2(egui::vec2(0.0, 7.0)), 3.0, ui.visuals().extreme_bg_color);
-            if self.range
-                && let Some(plan) = self.plan()
+            let out = range_bar::show(ui, width, duration, range, Some(self.cursor), step, &mut self.grab, |_, _| {});
+            if let Some(r) = range
+                && out.range != r
             {
-                let r = egui::Rect::from_x_y_ranges(x(plan.start)..=x(plan.end), bar.y_range()).shrink2(egui::vec2(0.0, 5.0));
-                painter.rect_filled(r, 3.0, ui.visuals().selection.bg_fill);
+                self.sel.start = out.range.0;
+                self.sel.end = Some(out.range.1);
             }
-            painter.line_segment([egui::pos2(x(self.cursor), bar.top()), egui::pos2(x(self.cursor), bar.bottom())], egui::Stroke::new(2.0, ui.visuals().strong_text_color()));
-            if let Some(p) = resp.interact_pointer_pos() {
-                self.cursor = (((p.x - bar.left()) / bar.width()) as f64 * duration).clamp(0.0, duration);
+            if let Some(t) = out.playhead {
+                self.cursor = t;
             }
         });
         if !ui.ctx().egui_wants_keyboard_input() {
-            let (left, right) = ui.input(|i| (i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
+            let (left, right, space) = ui.input(|i| (i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::Space)));
             if left {
                 self.cursor = (self.cursor - step).max(0.0);
             }
             if right {
                 self.cursor = (self.cursor + step).min((duration - step).max(0.0));
             }
+            if space {
+                self.toggle_play();
+            }
+        }
+        // Moving the playhead while playing carries on from the new place.
+        if self.playing() && (self.cursor - cursor_before).abs() > 1e-9 {
+            self.start_play(self.cursor);
         }
 
         if self.range {
@@ -386,7 +459,7 @@ mod tests {
 
     fn ready(p: &mut FramePicker) {
         match p.worker.replies.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
-            Msg::Info(Ok(info)) => p.info = Some(info),
+            Msg::Ready(Ok(r)) => p.info = r.video,
             _ => panic!("expected the video's info"),
         }
     }
@@ -423,5 +496,82 @@ mod tests {
         let Outcome::Done { edits: Some(e), .. } = p.done() else { panic!("expected a pick") };
         assert!(e.frames().unwrap().end.is_some(), "an animation for WebP needs an end");
         assert_eq!(e.crop(), Some(match crop { EditOp::Crop(r) => r, _ => unreachable!() }));
+    }
+
+    /// Run the picker's playback for about `secs`, as the UI would each frame.
+    fn run_for(p: &mut FramePicker, ctx: &egui::Context, secs: f64) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        while std::time::Instant::now() < until {
+            while let Ok(m) = p.worker.replies.try_recv() {
+                if let Msg::Ended(run) = m {
+                    p.video_ended |= p.play.as_ref().is_some_and(|pl| pl.run == run);
+                }
+            }
+            p.update_playback(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+    }
+
+    #[test]
+    fn an_animation_plays_at_its_own_rate_and_loops_over_its_range() {
+        let ctx = egui::Context::default();
+        let mut p = FramePicker::open(&ctx, 1, fixture(), Format::Mkv, Format::Gif, Options::default(), None);
+        ready(&mut p);
+        assert!(p.range, "a GIF is a range");
+        // 0.1–0.4 s at 5 fps: frames at 0.1, 0.3 (the source has them every 0.1 s).
+        p.sel = FrameSelection { start: 0.1, end: Some(0.4), fps: Some(5.0), ..Default::default() };
+        assert_eq!(p.play_bounds(), (0.1, 0.4));
+        p.toggle_play();
+        assert!(p.playing());
+        let mut seen = std::collections::BTreeSet::new();
+        let first_run = p.run;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs_f64(1.2);
+        while std::time::Instant::now() < until {
+            run_for(&mut p, &ctx, 0.02);
+            if let Some(t) = p.shown {
+                seen.insert((t * 10.0).round() as i64);
+                assert!((0.09..=0.41).contains(&t), "only the range is shown: {t}");
+            }
+        }
+        assert!(p.run > first_run, "it looped back to the start of the range");
+        assert!(seen.len() >= 2, "different frames were shown: {seen:?}");
+        assert!(p.cursor >= 0.1 - 1e-9 && p.cursor <= 0.4 + 0.05, "the playhead stays in the range: {}", p.cursor);
+        p.toggle_play();
+        assert!(!p.playing());
+    }
+
+    #[test]
+    fn a_single_frame_pick_plays_the_video_on_and_stops_at_the_end() {
+        let ctx = egui::Context::default();
+        let mut p = FramePicker::open(&ctx, 1, fixture(), Format::Mkv, Format::Jpeg, Options::default(), None);
+        ready(&mut p);
+        assert!(!p.range);
+        p.cursor = 0.1;
+        p.toggle_play();
+        run_for(&mut p, &ctx, 1.0);
+        assert!(!p.playing(), "stopped by itself at the end of the video");
+        // Playing from the end starts over; moving the playhead mid-play carries on from there.
+        p.cursor = p.duration();
+        p.toggle_play();
+        assert_eq!(p.cursor, 0.0);
+        p.stop_play();
+    }
+
+    #[test]
+    fn dragging_the_range_handles_changes_the_selection() {
+        let ctx = egui::Context::default();
+        let mut p = FramePicker::open(&ctx, 1, fixture(), Format::Mkv, Format::Gif, Options::default(), None);
+        ready(&mut p);
+        // Draw the picker once headlessly: it must lay out with the bar and handles.
+        for t in [0.0, 1.0] {
+            let input = egui::RawInput { time: Some(t), screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                let _ = p.ui(ui);
+            });
+            out.textures_delta.clear();
+        }
+        let plan = p.plan().unwrap();
+        assert_eq!(plan.start, 0.0);
+        assert!((plan.end - p.duration()).abs() < 0.01, "by default the whole (short) video: {} of {}", plan.end, p.duration());
     }
 }

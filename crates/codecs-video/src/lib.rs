@@ -6,7 +6,11 @@
 
 pub mod convert;
 mod decode;
-mod iso;
+pub mod encode;
+pub(crate) mod iso;
+mod mkv;
+pub mod output;
+pub mod vedit;
 
 pub use convert::VideoConverter;
 /// The `image` crate, as this crate uses it (for `RgbImage` and resizing).
@@ -66,18 +70,27 @@ pub enum Planes {
 impl Picture {
     /// 8-bit RGB, before any rotation.
     pub fn to_rgb8(&self) -> RgbImage {
+        self.to_rgb8_fit(u32::MAX)
+    }
+
+    /// 8-bit RGB with the longest side at most about `max_side`: every n-th pixel is taken
+    /// (no filtering), so only a fraction of the picture is converted. For previews.
+    pub fn to_rgb8_fit(&self, max_side: u32) -> RgbImage {
+        let step = self.width.max(self.height).div_ceil(max_side.max(1)).max(1);
         match &self.planes {
-            Planes::Rgb(img) => img.clone(),
+            Planes::Rgb(img) if step == 1 => img.clone(),
+            Planes::Rgb(img) => RgbImage::from_fn(img.width().div_ceil(step), img.height().div_ceil(step), |x, y| *img.get_pixel(x * step, y * step)),
             Planes::Yuv { bits, cw, ch, data, matrix, full_range } => {
-                yuv_to_rgb8(self.width, self.height, *bits, *cw, *ch, data, *matrix, *full_range)
+                yuv_to_rgb8(self.width, self.height, step, *bits, *cw, *ch, data, *matrix, *full_range)
             }
         }
     }
 }
 
-/// YUV → RGB (8-bit out). Chroma is sampled at the nearest position.
+/// YUV → RGB (8-bit out), taking every `step`-th pixel. Chroma is sampled at the nearest
+/// position.
 #[allow(clippy::too_many_arguments)]
-fn yuv_to_rgb8(w: u32, h: u32, bits: u8, cw: u32, ch: u32, data: &[Vec<u16>; 3], m: Matrix, full: bool) -> RgbImage {
+fn yuv_to_rgb8(w: u32, h: u32, step: u32, bits: u8, cw: u32, ch: u32, data: &[Vec<u16>; 3], m: Matrix, full: bool) -> RgbImage {
     let (kr, kb) = match m {
         Matrix::Bt601 => (0.299f32, 0.114f32),
         Matrix::Bt709 => (0.2126, 0.0722),
@@ -89,11 +102,13 @@ fn yuv_to_rgb8(w: u32, h: u32, bits: u8, cw: u32, ch: u32, data: &[Vec<u16>; 3],
     let (y_off, y_range, c_range) = if full { (0.0, max, max) } else { (16.0 * scale, 219.0 * scale, 224.0 * scale) };
     let c_mid = (1u32 << (bits - 1)) as f32;
     let (sx, sy) = (cw as f32 / w as f32, ch as f32 / h as f32);
-    let mut out = RgbImage::new(w, h);
-    for (y, row) in out.rows_mut().enumerate() {
+    let mut out = RgbImage::new(w.div_ceil(step), h.div_ceil(step));
+    for (oy, row) in out.rows_mut().enumerate() {
+        let y = oy * step as usize;
         let cy = ((y as f32 * sy) as usize).min(ch as usize - 1) * cw as usize;
         let yr = y * w as usize;
-        for (x, px) in row.enumerate() {
+        for (ox, px) in row.enumerate() {
+            let x = ox * step as usize;
             let c = cy + ((x as f32 * sx) as usize).min(cw as usize - 1);
             let yy = (data[0][yr + x] as f32 - y_off) / y_range;
             let cb = (data[1][c] as f32 - c_mid) / c_range;

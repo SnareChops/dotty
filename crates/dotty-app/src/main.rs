@@ -2,13 +2,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio_editor;
+mod crop_box;
 mod editor;
 mod frame_picker;
 mod player;
+mod range_bar;
+mod video_editor;
+mod video_worker;
 
 use audio_editor::AudioEditor;
 use editor::{Editor, Outcome};
 use frame_picker::FramePicker;
+use video_editor::VideoEditor;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
@@ -75,21 +80,23 @@ struct Entry {
 
 impl Entry {
     fn editable(&self) -> bool {
-        self.edits_as().is_some()
+        self.tool().is_some()
     }
 
-    /// Which editor this entry opens: a video going to an audio format gets the audio
-    /// editor for its soundtrack.
-    /// `Kind::Video` means the frame picker (a video going to an image format).
-    fn edits_as(&self) -> Option<Kind> {
-        match self.from.kind() {
-            Kind::Video => match self.to?.kind() {
-                Kind::Audio => Some(Kind::Audio),
-                Kind::Image => Some(Kind::Video),
-                Kind::Video => None,
-            },
-            k => Some(k),
+    /// Which editor "Edit" opens for this entry's source and target.
+    fn tool(&self) -> Option<Tool> {
+        let to = self.to?;
+        match (self.from.kind(), to.kind()) {
+            (Kind::Video, Kind::Audio) | (Kind::Audio, _) => Some(Tool::Audio),
+            (Kind::Video, Kind::Image) => Some(Tool::Frames),
+            (Kind::Video, Kind::Video) | (Kind::Image, Kind::Video) => Some(Tool::Video),
+            (Kind::Image, _) => Some(Tool::Image),
         }
+    }
+
+    /// The picture chosen for a song's video, if any.
+    fn picture_file(&self) -> Option<&PathBuf> {
+        self.edits.as_ref()?.video()?.picture_file.as_ref()
     }
 
     /// Whether the edits made parts of the image transparent.
@@ -117,13 +124,39 @@ struct App {
 /// A file found to hold several images.
 type Probe = (JobId, bool);
 
+/// The editors "Edit" can open.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tool {
+    Image,
+    Audio,
+    /// Picking a video's frame(s) for pictures.
+    Frames,
+    Video,
+}
+
 enum ActiveEditor {
     Image(Editor),
     Audio(AudioEditor),
     /// Picking a video's frame(s) for an image target.
-    Frames(FramePicker),
+    Frames(Box<FramePicker>),
+    /// Editing a video (or a picture that becomes one).
+    Video(Box<VideoEditor>),
     /// Editing the frames picked from a video; the pick is saved with the picture edits.
     VideoPicture(Editor, dotty_core::FrameSelection),
+}
+
+/// What an editor produced, plus the video edits already on the entry (a song's chosen
+/// picture lives there while the audio editor works on the sound).
+fn with_video_edits(existing: Option<&Edits>, edited: Option<Edits>) -> Option<Edits> {
+    let keep: Vec<dotty_core::EditOp> = existing.map(|e| e.ops.iter().filter(|op| matches!(op, dotty_core::EditOp::Video(_))).cloned().collect()).unwrap_or_default();
+    match edited {
+        Some(mut e) => {
+            e.ops.retain(|op| !matches!(op, dotty_core::EditOp::Video(_)));
+            e.ops.extend(keep);
+            Some(e)
+        }
+        None => (!keep.is_empty()).then_some(Edits { ops: keep }),
+    }
 }
 
 fn preset_from_str(s: &str) -> Preset {
@@ -200,11 +233,13 @@ impl App {
     }
 
     /// The target a newly added file starts with: the first reachable format, except that a
-    /// video's soundtrack most often goes to MP3.
+    /// video most often becomes another video (WebM plays everywhere; MP4 for WebM files).
     fn default_target(&self, from: Format) -> Option<Format> {
         let targets = self.registry.targets(from);
-        if from.kind() == Kind::Video && targets.contains(&Format::Mp3) {
-            return Some(Format::Mp3);
+        if from.kind() == Kind::Video
+            && let Some(t) = [Format::Webm, Format::Mp4, Format::Mkv].into_iter().find(|t| targets.contains(t))
+        {
+            return Some(t);
         }
         targets.into_iter().next()
     }
@@ -262,8 +297,9 @@ impl App {
 
     fn open_editor(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.entries[i];
-        self.editor = Some(match e.edits_as() {
-            Some(Kind::Audio) => {
+        self.editor = Some(match e.tool() {
+            Some(Tool::Video) => ActiveEditor::Video(Box::new(VideoEditor::open(ctx, e.id, e.path.clone(), e.from, e.edits.clone()))),
+            Some(Tool::Audio) => {
                 // Normalizing in the editor measures the layout the target will be written in.
                 let output_channels = e.to.and_then(|to| match self.options.choice(to, &codecs_audio::CHANNELS) {
                     "mono" => Some(1),
@@ -272,9 +308,9 @@ impl App {
                 });
                 ActiveEditor::Audio(AudioEditor::open(ctx, e.id, e.path.clone(), e.from, e.edits.clone(), output_channels))
             }
-            Some(Kind::Video) => {
+            Some(Tool::Frames) => {
                 let to = e.to.unwrap_or(Format::Png);
-                ActiveEditor::Frames(FramePicker::open(ctx, e.id, e.path.clone(), e.from, to, self.options.clone(), e.edits.clone()))
+                ActiveEditor::Frames(Box::new(FramePicker::open(ctx, e.id, e.path.clone(), e.from, to, self.options.clone(), e.edits.clone())))
             }
             _ => ActiveEditor::Image(Editor::open(ctx, e.id, e.path.clone(), e.from, self.options.clone(), e.edits.clone())),
         });
@@ -312,6 +348,16 @@ impl App {
     fn show_editor(&mut self, ctx: &egui::Context) {
         match &mut self.editor {
             None => {}
+            Some(ActiveEditor::Video(editor)) => match editor.show(ctx) {
+                video_editor::Outcome::Open => {}
+                video_editor::Outcome::Cancelled => self.editor = None,
+                video_editor::Outcome::Done { edits, thumb } => {
+                    let id = editor.entry;
+                    self.editor = None;
+                    // (A song's sound edits are carried through the editor, which shows its range.)
+                    self.set_edits(ctx, id, edits, thumb);
+                }
+            },
             Some(ActiveEditor::Frames(picker)) => match picker.show(ctx) {
                 frame_picker::Outcome::Open => {}
                 frame_picker::Outcome::Cancelled => self.editor = None,
@@ -357,6 +403,8 @@ impl App {
                     let id = editor.entry;
                     self.editor = None;
                     let edited = edits.is_some();
+                    let existing = self.entries.iter().find(|e| e.id == id).and_then(|e| e.edits.clone());
+                    let edits = with_video_edits(existing.as_deref(), edits);
                     self.set_edits(ctx, id, edits, thumb);
                     if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
                         e.edited_length = edited.then_some(length);
@@ -465,7 +513,7 @@ impl App {
     }
 
     fn supported_formats(&self, ui: &mut egui::Ui) {
-        for (kind, name) in [(Kind::Image, "Images"), (Kind::Audio, "Audio"), (Kind::Video, "Video (to sound or pictures for now)")] {
+        for (kind, name) in [(Kind::Image, "Images"), (Kind::Audio, "Audio"), (Kind::Video, "Video")] {
             let list: Vec<String> = Format::ALL
                 .into_iter()
                 .filter(|f| f.kind() == kind && !self.registry.targets(*f).is_empty())
@@ -528,6 +576,7 @@ impl App {
         let mut go = None;
         let mut edit = None;
         let mut discard = None;
+        let mut edit_picture = None;
         let targets: Vec<Vec<Format>> = self.entries.iter().map(|e| self.targets(e)).collect();
         let checker = &self.checker;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -559,7 +608,8 @@ impl App {
                         }
                     }
                     if e.editable() {
-                        let audio = e.edits_as() == Some(Kind::Audio);
+                        let tool = e.tool();
+                        let audio = tool == Some(Tool::Audio);
                         let video = e.from.kind() == Kind::Video;
                         let backing = (!audio).then_some(checker);
                         if let Some(tex) = &e.preview {
@@ -579,7 +629,9 @@ impl App {
                             });
                         }
                         let label = if e.edits.is_some() { "Edit •" } else { "Edit" };
-                        let help = if video && !audio {
+                        let help = if tool == Some(Tool::Video) {
+                            "Trim, crop, rotate, change speed, fade, add text or change the sound before converting"
+                        } else if video && !audio {
                             "Pick the frame (or the stretch for an animation), then edit the picture if you like"
                         } else if video {
                             "Edit the soundtrack before converting: trim, fade, change speed or pitch, filter, add effects or change the volume"
@@ -590,6 +642,15 @@ impl App {
                         };
                         if ui.add_enabled(editable, egui::Button::new(label)).on_hover_text(help).clicked() {
                             edit = Some(i);
+                        }
+                        // A song becoming a video: its picture, text, fades (its sound is "Edit").
+                        if e.from.kind() == Kind::Audio && e.to.is_some_and(|t| t.kind() == Kind::Video) {
+                            let chosen = e.picture_file().is_some() || e.edits.as_ref().and_then(|x| x.video()).is_some();
+                            let label = if chosen { "🎬 Picture •" } else { "🎬 Picture" };
+                            let tip = "Choose the picture shown with the song (else its cover art), and add text, fades or a crop";
+                            if ui.add_enabled(editable, egui::Button::new(label)).on_hover_text(tip).clicked() {
+                                edit_picture = Some(i);
+                            }
                         }
                     }
                     if e.to.is_some() && e.status.pending() && ui.button("Go").on_hover_text("Convert this file").clicked() {
@@ -627,6 +688,10 @@ impl App {
         }
         if let Some(id) = discard {
             self.set_edits(ui.ctx(), id, None, None);
+        }
+        if let Some(i) = edit_picture {
+            let e = &self.entries[i];
+            self.editor = Some(ActiveEditor::Video(Box::new(VideoEditor::open(ui.ctx(), e.id, e.path.clone(), e.from, e.edits.clone()))));
         }
         if let Some(i) = remove {
             self.entries.remove(i);
@@ -1047,9 +1112,13 @@ mod tests {
         app.add_files([video]);
         let e = &app.entries[0];
         assert_eq!((e.from, e.from.kind()), (Format::Mkv, Kind::Video));
-        assert_eq!(e.to, Some(Format::Mp3), "a video's sound goes to MP3 by default");
-        assert!(app.targets(e).iter().all(|t| t.kind() != Kind::Video), "sound or pictures only, so far");
-        assert_eq!(e.edits_as(), Some(Kind::Audio), "Edit opens the audio editor on the soundtrack");
+        assert_eq!(e.to, Some(Format::Webm), "a video becomes WebM by default");
+        let targets = app.targets(e);
+        assert!(targets.contains(&Format::Mp4) && targets.contains(&Format::Mp3) && targets.contains(&Format::Png));
+        assert!(!targets.contains(&Format::Mkv), "not its own format until it's edited");
+        assert_eq!(e.tool(), Some(Tool::Video), "Edit opens the video editor");
+        app.entries[0].to = Some(Format::Mp3);
+        assert_eq!(app.entries[0].tool(), Some(Tool::Audio), "Edit opens the audio editor on the soundtrack");
 
         app.convert_all();
         wait_idle(&mut app);
@@ -1068,7 +1137,7 @@ mod tests {
         app.add_files([video]);
         assert!(app.targets(&app.entries[0]).contains(&Format::Png));
         app.entries[0].to = Some(Format::Png);
-        assert_eq!(app.entries[0].edits_as(), Some(Kind::Video), "Edit opens the frame picker");
+        assert_eq!(app.entries[0].tool(), Some(Tool::Frames), "Edit opens the frame picker");
         app.convert_all();
         wait_idle(&mut app);
         if let Status::Failed(m) = &app.entries[0].status {
@@ -1078,5 +1147,38 @@ mod tests {
         assert_eq!(codecs_video::image::image_dimensions(dir.join("clip.png")).unwrap(), (64, 64));
         std::fs::remove_dir_all(&dir).ok();
     }
-}
 
+    #[test]
+    fn a_songs_picture_edits_and_sound_edits_live_side_by_side() {
+        let dir = std::env::temp_dir().join(format!("tf-app-songpic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let song = dir.join("song.mp3");
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../codecs-video/tests/fixtures/song_with_cover.mp3"), &song).unwrap();
+        let pic = dir.join("pic.png");
+        codecs_video::image::RgbImage::from_pixel(40, 30, codecs_video::image::Rgb([9, 99, 199])).save(&pic).unwrap();
+
+        let mut app = app();
+        app.add_files([song]);
+        app.entries[0].to = Some(Format::Webm);
+        assert_eq!(app.entries[0].tool(), Some(Tool::Audio), "Edit is still the sound editor for a song");
+        let picture = Edits { ops: vec![dotty_core::EditOp::Video(dotty_core::VideoEdits { picture_file: Some(pic.clone()), ..Default::default() })] };
+        let sound = Edits { ops: vec![dotty_core::EditOp::Audio(dotty_core::AudioEdits { volume: dotty_core::Volume::Gain(-3.0), ..Default::default() })] };
+
+        // Each editor's result keeps what the other made.
+        let both = Edits { ops: picture.ops.iter().chain(sound.ops.iter()).cloned().collect() };
+        assert!(both.audio().is_some() && both.video().unwrap().picture_file.as_ref() == Some(&pic));
+        let both_again = with_video_edits(Some(&picture), Some(sound.clone())).unwrap();
+        assert!(both_again.audio().is_some() && both_again.video().is_some());
+        assert!(with_video_edits(Some(&picture), None).unwrap().video().is_some(), "clearing the sound edits keeps the picture");
+        assert!(with_video_edits(None, None).is_none());
+
+        app.entries[0].edits = Some(Arc::new(both));
+        app.convert_all();
+        wait_idle(&mut app);
+        if let Status::Failed(m) = &app.entries[0].status {
+            panic!("failed: {m}");
+        }
+        assert_eq!(codecs_video::VideoReader::open(&dir.join("song.webm"), Format::Webm, 1).unwrap().info().display_size(), (40, 30), "the chosen picture, not the 120×90 cover");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
