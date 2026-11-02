@@ -6,8 +6,22 @@ use dotty_core::{ConvertCtx, Converter, Format, Options};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+/// Quick pass: every sample becomes a still; the film clips and AV1 samples are left out of
+/// the GIF pass (AV1 decodes slowly without the assembly decoder, about 4 frames a second).
 #[test]
+fn sample_videos_become_stills_and_short_ones_gifs() {
+    stills_and_gifs(true);
+}
+
+/// Every sample becomes a still and a GIF, including the films and AV1. Takes many minutes.
+/// Run with `cargo test -p codecs-video --test testdata -- --ignored`.
+#[test]
+#[ignore = "slow (many minutes): films and AV1 clips become GIFs"]
 fn sample_videos_become_stills_and_gifs() {
+    stills_and_gifs(false);
+}
+
+fn stills_and_gifs(fast: bool) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/video");
     let Ok(entries) = std::fs::read_dir(&root) else {
         eprintln!("testdata/video missing; run scripts/fetch-testdata.sh");
@@ -22,6 +36,9 @@ fn sample_videos_become_stills_and_gifs() {
         let name = src.file_name().unwrap().to_string_lossy().into_owned();
         let from = Format::detect(&src).unwrap();
         for to in [Format::Png, Format::Gif] {
+            if fast && to == Format::Gif && (name.starts_with("caminandes") || name.contains("av1")) {
+                continue;
+            }
             let dst = out.join(format!("{name}.{}", to.extension()));
             let ctx = ConvertCtx::new(&options, &cancel, &progress);
             let t = std::time::Instant::now();

@@ -18,13 +18,14 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use dotty_core::{
-    Choice, Edits, Format, JobEvent, JobId, JobRequest, JobRunner, Kind, Options, Preset, Registry,
+    BundleMode, Choice, Edits, Format, JobEvent, JobId, JobRequest, JobRunner, Kind, Options, Preset, Registry,
 };
 
 const KEY_PRESET: &str = "preset";
 const KEY_STRIP: &str = "strip_metadata";
 const KEY_DEST: &str = "dest_dir";
 const KEY_SPLIT: &str = "split_frames";
+const KEY_BUNDLE: &str = "bundle";
 const KEY_CHOICES: &str = "format_choices";
 
 /// Format choices as `ext:key=value;…` for storage.
@@ -91,6 +92,7 @@ impl Entry {
             (Kind::Video, Kind::Image) => Some(Tool::Frames),
             (Kind::Video, Kind::Video) | (Kind::Image, Kind::Video) => Some(Tool::Video),
             (Kind::Image, _) => Some(Tool::Image),
+            _ => None,
         }
     }
 
@@ -119,6 +121,9 @@ struct App {
     /// (it means decoding a little of each file, which would stall the window for big drops).
     probes: (mpsc::Sender<Probe>, mpsc::Receiver<Probe>),
     ctx: egui::Context,
+    /// Entries waiting for the answer to "folder or zip?" (shown as a prompt).
+    ask_bundle: Option<Vec<JobId>>,
+    remember_bundle: bool,
 }
 
 /// A file found to hold several images.
@@ -159,6 +164,14 @@ fn with_video_edits(existing: Option<&Edits>, edited: Option<Edits>) -> Option<E
     }
 }
 
+fn bundle_key(b: Option<BundleMode>) -> &'static str {
+    match b {
+        Some(BundleMode::Folder) => "folder",
+        Some(BundleMode::Zip) => "zip",
+        None => "",
+    }
+}
+
 fn preset_from_str(s: &str) -> Preset {
     Preset::ALL.into_iter().find(|p| p.label() == s).unwrap_or_default()
 }
@@ -172,6 +185,11 @@ impl App {
             }
             options.strip_metadata = storage.get_string(KEY_STRIP).is_some_and(|s| s == "true");
             options.split_frames = storage.get_string(KEY_SPLIT).is_some_and(|s| s == "true");
+            options.bundle = match storage.get_string(KEY_BUNDLE).as_deref() {
+                Some("folder") => Some(BundleMode::Folder),
+                Some("zip") => Some(BundleMode::Zip),
+                _ => None,
+            };
             if let Some(s) = storage.get_string(KEY_CHOICES) {
                 choices_from_string(&s, &mut options);
             }
@@ -188,6 +206,8 @@ impl App {
         codecs_image::register(&mut registry);
         codecs_audio::register(&mut registry);
         codecs_video::register(&mut registry);
+        codecs_data::register(&mut registry);
+        codecs_font::register(&mut registry);
         let registry = Arc::new(registry);
 
         // Large files are memory-hungry (some encoders hold the whole stream), so don't
@@ -197,7 +217,7 @@ impl App {
         let wake = ctx.clone();
         let runner = JobRunner::new(registry.clone(), (cores / 2).clamp(1, 8), move || wake.request_repaint());
         let probes = mpsc::channel();
-        Self { registry, runner, entries: Vec::new(), next_id: 0, options, notice: None, editor: None, checker, probes, ctx }
+        Self { registry, runner, entries: Vec::new(), next_id: 0, options, notice: None, editor: None, checker, probes, ctx, ask_bundle: None, remember_bundle: false }
     }
 
     fn add_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
@@ -273,13 +293,36 @@ impl App {
     }
 
     fn convert_all(&mut self) {
+        let all = self.entries.iter().map(|e| e.id).collect();
+        self.start(all);
+    }
+
+    /// Whether converting this entry would make many files (a folder or a zip of them).
+    fn makes_many(&self, e: &Entry) -> bool {
+        e.status.pending() && e.to.is_some_and(|to| self.registry.many_files(&e.path, e.from, to, &self.options))
+    }
+
+    /// Queue the entries with these ids; first asks "folder or zip?" when any of them makes
+    /// many files and no standing answer is set.
+    fn start(&mut self, ids: Vec<JobId>) {
+        self.start_with(ids, None);
+    }
+
+    fn start_with(&mut self, ids: Vec<JobId>, answer: Option<BundleMode>) {
+        let asks = self.options.bundle.is_none() && answer.is_none() && self.entries.iter().any(|e| ids.contains(&e.id) && self.makes_many(e));
+        if asks {
+            self.ask_bundle = Some(ids);
+            return;
+        }
         for i in 0..self.entries.len() {
-            self.convert(i);
+            if ids.contains(&self.entries[i].id) {
+                self.convert(i, answer);
+            }
         }
     }
 
     /// Queue one entry if it has a target and isn't already done or in flight.
-    fn convert(&mut self, i: usize) {
+    fn convert(&mut self, i: usize, answer: Option<BundleMode>) {
         let e = &mut self.entries[i];
         let Some(to) = e.to else { return };
         if !e.status.pending() {
@@ -287,7 +330,9 @@ impl App {
         }
         e.status = Status::Queued;
         let edits = e.edits.clone();
-        self.runner.submit(JobRequest { id: e.id, src: e.path.clone(), from: e.from, to, options: self.options.clone(), edits });
+        let mut options = self.options.clone();
+        options.bundle = options.bundle.or(answer);
+        self.runner.submit(JobRequest { id: e.id, src: e.path.clone(), from: e.from, to, options, edits });
     }
 
     /// Targets offered for an entry: its own format too once it's edited.
@@ -342,6 +387,42 @@ impl App {
         }
         if e.edits != before && !e.status.busy() {
             e.status = Status::Ready;
+        }
+    }
+
+    /// "Folder or zip?" for results made of many files.
+    fn bundle_prompt(&mut self, ctx: &egui::Context) {
+        if self.ask_bundle.is_none() {
+            return;
+        }
+        let mut pick = None;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("bundle-prompt")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Many files");
+            ui.label("This makes one file for each page or frame. Put them in:");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                for m in [BundleMode::Folder, BundleMode::Zip] {
+                    if ui.button(m.label()).clicked() {
+                        pick = Some(m);
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+            ui.checkbox(&mut self.remember_bundle, "Remember my choice").on_hover_text("Change it later with \"Many files\" below the list");
+        });
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.ask_bundle = None;
+        } else if let Some(mode) = pick {
+            if self.remember_bundle {
+                self.options.bundle = Some(mode);
+            }
+            if let Some(ids) = self.ask_bundle.take() {
+                self.start_with(ids, Some(mode));
+            }
         }
     }
 
@@ -420,6 +501,10 @@ impl App {
     }
 
     /// Could a file in the list hold several images that its target can't keep together?
+    fn many_files_matter(&self) -> bool {
+        self.entries.iter().any(|e| e.status.pending() && e.to.is_some_and(|to| self.registry.many_files(&e.path, e.from, to, &self.options)))
+    }
+
     fn frames_matter(&self) -> bool {
         self.entries
             .iter()
@@ -513,7 +598,8 @@ impl App {
     }
 
     fn supported_formats(&self, ui: &mut egui::Ui) {
-        for (kind, name) in [(Kind::Image, "Images"), (Kind::Audio, "Audio"), (Kind::Video, "Video")] {
+        for kind in Kind::ALL {
+            let name = kind.title();
             let list: Vec<String> = Format::ALL
                 .into_iter()
                 .filter(|f| f.kind() == kind && !self.registry.targets(*f).is_empty())
@@ -527,7 +613,8 @@ impl App {
 
     /// "All images → [format]" shortcuts for every kind present in the list.
     fn bulk_targets(&mut self, ui: &mut egui::Ui) {
-        for (kind, label) in [(Kind::Image, "images"), (Kind::Audio, "audio files"), (Kind::Video, "videos")] {
+        for kind in Kind::ALL {
+            let label = kind.plural();
             let members: Vec<usize> = (0..self.entries.len())
                 .filter(|&i| self.entries[i].from.kind() == kind && !self.entries[i].status.busy())
                 .collect();
@@ -681,7 +768,8 @@ impl App {
             }
         });
         if let Some(i) = go {
-            self.convert(i);
+            let id = self.entries[i].id;
+            self.start(vec![id]);
         }
         if let Some(i) = edit {
             self.open_editor(ui.ctx(), i);
@@ -787,6 +875,7 @@ impl eframe::App for App {
         storage.set_string(KEY_PRESET, self.options.preset.label().to_string());
         storage.set_string(KEY_STRIP, self.options.strip_metadata.to_string());
         storage.set_string(KEY_SPLIT, self.options.split_frames.to_string());
+        storage.set_string(KEY_BUNDLE, bundle_key(self.options.bundle).to_string());
         storage.set_string(KEY_CHOICES, choices_to_string(&self.options));
         storage.set_string(KEY_DEST, self.options.dest_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default());
     }
@@ -812,6 +901,20 @@ impl eframe::App for App {
                     ui.checkbox(&mut self.options.split_frames, "Export every frame").on_hover_text(
                         "When an animation, multi-page file or multi-size icon goes to a format that can't hold all of it, save each image as its own file in a \"name-frames\" folder instead of keeping only the first.",
                     );
+                }
+
+                if self.many_files_matter() {
+                    ui.label("Many files:");
+                    egui::ComboBox::from_id_salt("bundle")
+                        .selected_text(self.options.bundle.map_or("Ask each time", BundleMode::label))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.options.bundle, None, "Ask each time");
+                            for m in [BundleMode::Folder, BundleMode::Zip] {
+                                ui.selectable_value(&mut self.options.bundle, Some(m), m.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text("When one file turns into many (a page or frame per image), put them in a folder or in a zip file.");
                 }
 
                 let dest = self.options.dest_dir.as_ref().map(|d| d.display().to_string());
@@ -853,6 +956,7 @@ impl eframe::App for App {
 
         let ctx = ui.ctx().clone();
         self.show_editor(&ctx);
+        self.bundle_prompt(&ctx);
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.drop_zone(ui);
@@ -959,7 +1063,7 @@ mod tests {
         app.add_files([a, b]);
         app.entries[0].to = Some(Format::Bmp);
         app.entries[1].to = Some(Format::Bmp);
-        app.convert(1);
+        app.convert(1, None);
         wait_idle(&mut app);
         assert!(app.entries[0].status == Status::Ready, "untouched row stays ready");
         assert!(matches!(app.entries[1].status, Status::Done(..)));
@@ -1179,6 +1283,90 @@ mod tests {
             panic!("failed: {m}");
         }
         assert_eq!(codecs_video::VideoReader::open(&dir.join("song.webm"), Format::Webm, 1).unwrap().info().display_size(), (40, 30), "the chosen picture, not the 120×90 cover");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn animated_gif(path: &std::path::Path) {
+        use codecs_video::image;
+        let mut enc = image::codecs::gif::GifEncoder::new(std::fs::File::create(path).unwrap());
+        for shade in [10u8, 120, 240] {
+            let buf = image::RgbaImage::from_pixel(8, 8, image::Rgba([shade, 0, 0, 255]));
+            enc.encode_frame(image::Frame::from_parts(buf, 0, 0, image::Delay::from_numer_denom_ms(100, 1))).unwrap();
+        }
+    }
+
+    #[test]
+    fn many_files_ask_for_a_folder_or_zip_unless_a_standing_choice_is_set() {
+        let dir = std::env::temp_dir().join(format!("tf-app-bundle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gif = dir.join("anim.gif");
+        animated_gif(&gif);
+        let plain = dir.join("plain.png");
+        std::fs::write(&plain, include_bytes!("../tests/tiny.png")).unwrap();
+
+        // One file out: no question.
+        let mut a = app();
+        a.options.split_frames = true;
+        a.add_files([plain.clone()]);
+        a.entries[0].to = Some(Format::Bmp);
+        a.convert_all();
+        assert!(a.ask_bundle.is_none());
+        wait_idle(&mut a);
+        assert!(dir.join("plain.bmp").exists());
+
+        // Many files out: the prompt comes first and nothing is queued yet.
+        let mut a = app();
+        a.options.split_frames = true;
+        a.add_files([gif.clone()]);
+        a.entries[0].to = Some(Format::Bmp);
+        assert!(a.many_files_matter());
+        a.convert_all();
+        assert!(a.ask_bundle.is_some() && !a.busy());
+        assert!(!dir.join("anim-frames").exists());
+
+        // Answering "zip" runs it once, without changing the standing choice.
+        let ids = a.ask_bundle.take().unwrap();
+        a.start_with(ids, Some(BundleMode::Zip));
+        wait_idle(&mut a);
+        assert!(a.options.bundle.is_none());
+        assert!(dir.join("anim-frames.zip").exists() && !dir.join("anim-frames").exists());
+
+        // A standing choice skips the question.
+        let mut a = app();
+        a.options.split_frames = true;
+        a.options.bundle = Some(BundleMode::Folder);
+        a.add_files([gif]);
+        a.entries[0].to = Some(Format::Bmp);
+        a.convert_all();
+        assert!(a.ask_bundle.is_none());
+        wait_idle(&mut a);
+        assert!(dir.join("anim-frames/anim-001.bmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn data_subtitles_and_fonts_convert_from_the_list() {
+        let dir = std::env::temp_dir().join(format!("tf-app-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("d.json"), r#"{"a": [1, 2], "b": {"c": "x"}}"#).unwrap();
+        std::fs::write(dir.join("s.srt"), "1\n00:00:01,000 --> 00:00:02,000\nHi\n").unwrap();
+        std::fs::write(dir.join("f.ttf"), include_bytes!("../../codecs-font/tests/fixtures/egui-icons.ttf")).unwrap();
+        let mut a = app();
+        a.add_files([dir.join("d.json"), dir.join("s.srt"), dir.join("f.ttf")]);
+        assert_eq!(a.entries.iter().map(|e| e.from).collect::<Vec<_>>(), [Format::Json, Format::Srt, Format::Ttf]);
+        assert!(a.entries.iter().all(|e| e.to.is_some()), "every kind gets a default target");
+        assert!(a.entries.iter().all(|e| !e.editable()), "no editor for these");
+        a.entries[0].to = Some(Format::Yaml);
+        a.entries[1].to = Some(Format::Vtt);
+        a.entries[2].to = Some(Format::Woff2);
+        a.convert_all();
+        wait_idle(&mut a);
+        for e in &a.entries {
+            assert!(matches!(e.status, Status::Done(..)), "{} not done", e.path.display());
+        }
+        assert!(std::fs::read_to_string(dir.join("d.yaml")).unwrap().contains("c: x"));
+        assert!(std::fs::read_to_string(dir.join("s.vtt")).unwrap().starts_with("WEBVTT"));
+        assert!(std::fs::read(dir.join("f.woff2")).unwrap().starts_with(b"wOF2"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

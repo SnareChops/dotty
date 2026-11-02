@@ -7,3 +7,4 @@ publish.workspace = true
 [dependencies]
 crossbeam-channel = "0.5.17"
 thiserror = "2.0.21"
+zip = { version = "9.2.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }

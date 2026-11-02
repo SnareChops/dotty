@@ -30,9 +30,9 @@ pub use encode_multi::{GifEncoder, PngEncoder, TiffEncoder, WebpEncoder};
 use image::DynamicImage;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
-use dotty_core::{Choice, ConvertCtx, Converter, Error, Format, Registry, Result, WriteSeek, output};
+use dotty_core::{Choice, ConvertCtx, Converter, Error, Format, Options, Registry, Result, WriteSeek};
 
 #[derive(Clone)]
 pub struct Frame {
@@ -220,6 +220,10 @@ impl Converter for ImageConverter {
         self.decoders.iter().find(|d| d.format() == from).is_some_and(|d| d.multi_image(path))
     }
 
+    fn many_files(&self, src: &Path, from: Format, to: Format, options: &Options) -> bool {
+        options.split_frames && !Format::keeps_all_images(from, to) && self.multi_image(src, from)
+    }
+
     fn source_choices(&self, from: Format) -> Vec<Choice> {
         self.decoders.iter().find(|d| d.format() == from).map(|d| d.choices()).unwrap_or_default()
     }
@@ -312,36 +316,35 @@ fn write_file(img: &ImageData, dst: &Path, encoder: &dyn ImageEncoder, ctx: &Con
     out.flush().map_err(|e| io_err(dst, e))
 }
 
-/// One file per image in a new `name-frames` folder next to `dst`.
+/// One file per image in a new `name-frames` folder (or zip) next to `dst`.
 fn write_frames(img: ImageData, from: Format, dst: &Path, encoder: &dyn ImageEncoder, ctx: &ConvertCtx) -> Result<()> {
-    let dir = output::frames_dir(dst).map_err(|e| io_err(dst, e))?;
+    let mut bundle = dotty_core::Bundle::create(dst, "frames", ctx.options.bundle.unwrap_or_default())?;
     let count = img.frames.len();
     let result = (|| {
         let stem = dst.file_stem().map_or_else(|| "frame".into(), |s| s.to_string_lossy());
         let ext = encoder.format().extension();
         let width = count.to_string().len().max(3);
-        let mut first = None;
         let ImageData { frames, exif, icc, pages, .. } = img;
         for (i, frame) in frames.into_iter().enumerate() {
             ctx.check_cancelled()?;
-            let path = dir.join(format!("{stem}-{:0width$}.{ext}", i + 1));
             let single = ImageData { frames: vec![frame], exif: exif.clone(), icc: icc.clone(), more_frames: false, pages, loops: 0 };
             let single = color::for_encoder(single, encoder.float(), from, ctx.options);
-            write_file(&single, &path, encoder, ctx)?;
-            first.get_or_insert(path);
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            encoder.encode(&single, ctx, &mut bytes)?;
+            bundle.add(&format!("{stem}-{:0width$}.{ext}", i + 1), bytes.get_ref())?;
             (ctx.progress)(0.5 + 0.5 * (i + 1) as f32 / count as f32);
         }
-        Ok::<PathBuf, Error>(first.expect("at least one frame"))
+        Ok::<(), Error>(())
     })();
     match result {
-        Ok(first) => {
-            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            ctx.note(format!("Saved {count} images to the folder \"{name}\""));
-            ctx.set_output(first);
+        Ok(()) => {
+            let (name, zip) = (bundle.name(), ctx.options.bundle == Some(dotty_core::BundleMode::Zip));
+            ctx.note(if zip { format!("Saved {count} images in the zip \"{name}\"") } else { format!("Saved {count} images to the folder \"{name}\"") });
+            ctx.set_output(bundle.finish()?);
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&dir); // don't leave partial output
+            bundle.abort(); // don't leave partial output
             Err(e)
         }
     }

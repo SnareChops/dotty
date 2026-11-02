@@ -39,24 +39,6 @@ pub fn output_path(src: &Path, to: Format, opts: &Options) -> std::io::Result<Pa
     unreachable!("unbounded range")
 }
 
-/// Create a fresh folder next to `dst` to hold one file per animation frame
-/// (`name-frames`, `name-frames (1)`, …). Creating it is what claims the name.
-pub fn frames_dir(dst: &Path) -> std::io::Result<PathBuf> {
-    let dir = dst.parent().map(Path::to_path_buf).unwrap_or_default();
-    let stem = dst.file_stem().unwrap_or("output".as_ref());
-    let mut base = stem.to_os_string();
-    base.push("-frames");
-    for n in 0.. {
-        let path = dir.join(numbered(&base, n, ""));
-        match std::fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!("unbounded range")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,9 +59,6 @@ mod tests {
         assert_eq!(output_path(&src, Format::Png, &opts).unwrap(), dir.join("pic (1).png"));
         assert_eq!(std::fs::read(&src).unwrap(), b"x");
 
-        assert_eq!(frames_dir(&dir.join("pic.jpg")).unwrap(), dir.join("pic-frames"));
-        assert_eq!(frames_dir(&dir.join("pic.jpg")).unwrap(), dir.join("pic-frames (1)"));
-        assert!(dir.join("pic-frames (1)").is_dir());
         std::fs::remove_dir_all(&dir).ok();
     }
 

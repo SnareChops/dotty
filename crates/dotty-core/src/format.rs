@@ -7,6 +7,47 @@ pub enum Kind {
     Image,
     Audio,
     Video,
+    Document,
+    Data,
+    Archive,
+    Font,
+    Subtitle,
+    Model,
+}
+
+impl Kind {
+    /// In the order the app lists them.
+    pub const ALL: [Kind; 9] = [Kind::Image, Kind::Audio, Kind::Video, Kind::Document, Kind::Data, Kind::Archive, Kind::Font, Kind::Subtitle, Kind::Model];
+
+    /// Heading for the list of supported formats.
+    pub fn title(self) -> &'static str {
+        match self {
+            Kind::Image => "Images",
+            Kind::Audio => "Audio",
+            Kind::Video => "Video",
+            Kind::Document => "Documents",
+            Kind::Data => "Data",
+            Kind::Archive => "Archives",
+            Kind::Font => "Fonts",
+            Kind::Subtitle => "Subtitles",
+            Kind::Model => "3D models",
+        }
+    }
+
+    /// Plural noun for "All … →" shortcuts.
+    pub fn plural(self) -> &'static str {
+        match self {
+            Kind::Image => "images",
+            Kind::Audio => "audio files",
+            Kind::Video => "videos",
+            Kind::Document => "documents",
+            Kind::Data => "data files",
+            Kind::Archive => "archives",
+            Kind::Font => "fonts",
+            Kind::Subtitle => "subtitle files",
+            Kind::Model => "3D models",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -43,10 +84,22 @@ pub enum Format {
     Mkv,
     Webm,
     Avi,
+    Json,
+    Yaml,
+    Toml,
+    Xml,
+    Csv,
+    Srt,
+    Vtt,
+    Ass,
+    Ttf,
+    Otf,
+    Woff,
+    Woff2,
 }
 
 impl Format {
-    pub const ALL: [Format; 32] = [
+    pub const ALL: [Format; 44] = [
         Format::Png,
         Format::Jpeg,
         Format::Gif,
@@ -79,6 +132,18 @@ impl Format {
         Format::Mkv,
         Format::Webm,
         Format::Avi,
+        Format::Json,
+        Format::Yaml,
+        Format::Toml,
+        Format::Xml,
+        Format::Csv,
+        Format::Srt,
+        Format::Vtt,
+        Format::Ass,
+        Format::Ttf,
+        Format::Otf,
+        Format::Woff,
+        Format::Woff2,
     ];
 
     pub fn kind(self) -> Kind {
@@ -89,6 +154,9 @@ impl Format {
             }
             Wav | Flac | Mp3 | Ogg | Opus | Aiff | Caf | M4a | Mka | Mp2 => Kind::Audio,
             Mp4 | Mov | Mkv | Webm | Avi => Kind::Video,
+            Json | Yaml | Toml | Xml | Csv => Kind::Data,
+            Srt | Vtt | Ass => Kind::Subtitle,
+            Ttf | Otf | Woff | Woff2 => Kind::Font,
         }
     }
 
@@ -127,6 +195,18 @@ impl Format {
             Format::Mkv => "mkv",
             Format::Webm => "webm",
             Format::Avi => "avi",
+            Format::Json => "json",
+            Format::Yaml => "yaml",
+            Format::Toml => "toml",
+            Format::Xml => "xml",
+            Format::Csv => "csv",
+            Format::Srt => "srt",
+            Format::Vtt => "vtt",
+            Format::Ass => "ass",
+            Format::Ttf => "ttf",
+            Format::Otf => "otf",
+            Format::Woff => "woff",
+            Format::Woff2 => "woff2",
         }
     }
 
@@ -233,6 +313,18 @@ impl Format {
             "webm" => Format::Webm,
             "avi" => Format::Avi,
             "mp2" | "mp1" | "mpa" | "m2a" => Format::Mp2,
+            "json" | "geojson" | "jsonc" => Format::Json,
+            "yaml" | "yml" => Format::Yaml,
+            "toml" => Format::Toml,
+            "xml" | "plist" | "xsd" | "rss" | "atom" => Format::Xml,
+            "csv" | "tsv" => Format::Csv,
+            "srt" => Format::Srt,
+            "vtt" => Format::Vtt,
+            "ass" | "ssa" => Format::Ass,
+            "ttf" => Format::Ttf,
+            "otf" => Format::Otf,
+            "woff" => Format::Woff,
+            "woff2" => Format::Woff2,
             _ => return None,
         })
     }
@@ -292,6 +384,16 @@ impl Format {
         } else if starts(&[0x1A, 0x45, 0xDF, 0xA3]) {
             // Matroska or WebM, audio or video: `probe::refine` looks at the tracks.
             Some(Format::Mkv)
+        } else if starts(b"wOFF") {
+            Some(Format::Woff)
+        } else if starts(b"wOF2") {
+            Some(Format::Woff2)
+        } else if starts(b"OTTO") {
+            Some(Format::Otf)
+        } else if starts(&[0, 1, 0, 0, 0]) || starts(b"true") {
+            Some(Format::Ttf)
+        } else if text.trim_start_matches('\u{feff}').starts_with("WEBVTT") {
+            Some(Format::Vtt)
         } else if starts(b"fLaC") {
             Some(Format::Flac)
         } else if starts(b"OggS") {
@@ -356,6 +458,10 @@ mod tests {
         assert_eq!(Format::sniff(b"  <svg xmlns="), Some(Format::Svg));
         assert_eq!(Format::sniff(&[0xFF, 0xFD, 0x90]), Some(Format::Mp2));
         assert_eq!(Format::sniff(&[0xFF, 0xFB, 0x90]), Some(Format::Mp3));
+        assert_eq!(Format::sniff(b"wOF2\0\x01\0\0"), Some(Format::Woff2));
+        assert_eq!(Format::sniff(b"OTTO\0\x0a"), Some(Format::Otf));
+        assert_eq!(Format::sniff(b"\0\x01\0\0\0\x0a"), Some(Format::Ttf));
+        assert_eq!(Format::sniff(b"\xef\xbb\xbfWEBVTT\n\n"), Some(Format::Vtt));
         assert_eq!(Format::sniff(b"nope"), None);
     }
 

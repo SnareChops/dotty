@@ -73,6 +73,11 @@ pub trait Converter: Send + Sync {
     fn source_choices(&self, _from: Format) -> Vec<Choice> {
         Vec::new()
     }
+    /// Whether this conversion would make many files rather than one (so the app can ask
+    /// whether they go in a folder or a zip first). Cheap: headers at most.
+    fn many_files(&self, _src: &Path, _from: Format, _to: Format, _options: &Options) -> bool {
+        false
+    }
     /// Quick check (headers only, where possible) whether `path` holds several images.
     fn multi_image(&self, _path: &Path, _from: Format) -> bool {
         false
@@ -124,6 +129,11 @@ impl Registry {
     /// Whether the file holds several images (animation frames, pages, icon sizes).
     pub fn multi_image(&self, path: &Path, from: Format) -> bool {
         from.multi_image_input() && self.reading(from).is_some_and(|c| c.multi_image(path, from))
+    }
+
+    /// Whether converting `src` would make many files (see [`Converter::many_files`]).
+    pub fn many_files(&self, src: &Path, from: Format, to: Format, options: &Options) -> bool {
+        self.find(from, to).is_some_and(|c| c.many_files(src, from, to, options))
     }
 
     /// Settings offered for reading `from`.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/codecs-image", "crates/codecs-audio", "crates/codecs-video", "crates/dotty-core", "crates/dotty-app"]
+members = ["crates/codecs-image", "crates/codecs-audio", "crates/codecs-video", "crates/codecs-data", "crates/codecs-font", "crates/dotty-core", "crates/dotty-app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,7 +11,10 @@ publish = false
 lto = "thin"
 codegen-units = 1
 
-# Codec dependencies are far too slow unoptimised; keep them fast in dev/test builds.
+# Dependencies (codecs especially) are far too slow unoptimised; keep them fast in dev/test builds.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.dev.package.oxideav-vorbis]
 opt-level = 3
 [profile.dev.package.rusty_mp3]

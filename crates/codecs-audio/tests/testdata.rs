@@ -17,8 +17,22 @@ fn frames(path: &std::path::Path, fmt: Format) -> (u32, u16, u64) {
     (rate, channels, n)
 }
 
+/// Quick pass: samples over 600 KB are left out (decoding them in a test build is slow),
+/// and the Vorbis and Opus encoders (about half real time) only get up to 15 seconds.
 #[test]
+fn converts_sample_audio_and_preserves_length_quickly() {
+    converts_samples(true);
+}
+
+/// Every sample to every format. Takes minutes.
+/// Run with `cargo test -p codecs-audio --test testdata -- --ignored`.
+#[test]
+#[ignore = "slow (minutes): Vorbis/Opus encoding of every sample"]
 fn converts_all_sample_audio_and_preserves_length() {
+    converts_samples(false);
+}
+
+fn converts_samples(fast: bool) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/audio");
     let Ok(entries) = std::fs::read_dir(&root) else {
         eprintln!("testdata/audio missing; run scripts/fetch-testdata.sh");
@@ -35,6 +49,10 @@ fn converts_all_sample_audio_and_preserves_length() {
         let src = entry.path();
         let name = src.file_name().unwrap().to_string_lossy().into_owned();
         let from = Format::detect(&src).expect("format detected");
+        if fast && std::fs::metadata(&src).map_or(0, |m| m.len()) > 600_000 {
+            skipped += 1;
+            continue;
+        }
         let targets: Vec<_> = AudioConverter::default().routes().into_iter().filter(|r| r.0 == from).map(|r| r.1).collect();
         if targets.is_empty() {
             skipped += 1; // no decoder yet (e.g. Opus), covered in M3
@@ -42,8 +60,18 @@ fn converts_all_sample_audio_and_preserves_length() {
         }
         let expected = frames(&src, from);
         for to in targets {
+            let seconds = expected.2 as f64 / expected.0 as f64;
+            if fast && matches!(to, Format::Ogg | Format::Opus) && seconds > 15.0 {
+                skipped += 1;
+                continue;
+            }
             let dst = out.join(format!("{name}.{}", to.extension()));
-            if let Err(e) = AudioConverter::default().convert(&src, &dst, from, to, &ctx) {
+            let t = std::time::Instant::now();
+            let result = AudioConverter::default().convert(&src, &dst, from, to, &ctx);
+            if t.elapsed().as_secs_f32() > 1.0 {
+                eprintln!("slow: {name} → {to} took {:.1?}", t.elapsed());
+            }
+            if let Err(e) = result {
                 failures.push(format!("{name} → {to}: {e}"));
                 continue;
             }

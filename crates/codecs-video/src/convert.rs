@@ -107,6 +107,11 @@ fn scale(img: DynamicImage, w: u32, h: u32) -> DynamicImage {
 }
 
 impl Converter for VideoConverter {
+    /// Frames of a video, one file each (the same rule as for animations).
+    fn many_files(&self, _: &Path, from: Format, to: Format, options: &dotty_core::Options) -> bool {
+        from.kind() == Kind::Video && to.kind() == Kind::Image && options.split_frames && !Format::keeps_all_images(from, to)
+    }
+
     /// Videos → pictures and → videos; pictures and sound → videos.
     fn routes(&self) -> Vec<(Format, Format)> {
         let pictures: Vec<Format> = Format::ALL
@@ -137,6 +142,7 @@ impl Converter for VideoConverter {
                 Kind::Video => output::from_video(src, from, ctx, &mut out, to)?,
                 Kind::Image => output::from_image(src, from, ctx, &mut out, to)?,
                 Kind::Audio => output::from_audio(src, from, ctx, &mut out, to)?,
+                _ => return Err(Error::NoRoute { from, to }),
             }
             use std::io::Write;
             out.flush().map_err(|source| Error::Io { path: dst.into(), source })?;

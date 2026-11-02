@@ -1,6 +1,7 @@
 //! UI-free conversion core: format registry, sniffing, presets, output
 //! naming, and the job queue.
 
+pub mod bundle;
 pub mod edit;
 pub mod format;
 pub mod jobs;
@@ -8,6 +9,7 @@ pub mod output;
 pub mod probe;
 pub mod registry;
 
+pub use bundle::{Bundle, BundleMode};
 pub use edit::{AudioEdits, Caption, CaptionFont, Captions, Channels, Drawing, Echo, EditOp, Edits, FrameSelection, Mask, Region, Reverb, Stroke, VideoEdits, VideoText, Volume};
 pub use format::{Format, Kind};
 pub use jobs::{JobEvent, JobId, JobRequest, JobRunner};
@@ -96,6 +98,9 @@ pub struct Options {
     /// When an animation goes to a format that holds one frame, write every frame as its
     /// own file instead of keeping only the first.
     pub split_frames: bool,
+    /// Where a result made of many files goes. `None` = not chosen: the app asks before it
+    /// starts (converters treat it as a folder).
+    pub bundle: Option<BundleMode>,
     /// Picked values of format [`Choice`]s, by target format and choice key.
     pub choices: BTreeMap<(Format, String), String>,
 }
