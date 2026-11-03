@@ -96,10 +96,30 @@ pub enum Format {
     Otf,
     Woff,
     Woff2,
+    Zip,
+    Cbz,
+    Tar,
+    TarGz,
+    Gz,
+    SevenZ,
+    Folder,
+    Favicon,
+    Md,
+    Html,
+    Pdf,
+    Txt,
+    Epub,
+    Mobi,
+    Raw,
+    Stl,
+    Obj,
+    Ply,
+    Gltf,
+    Glb,
 }
 
 impl Format {
-    pub const ALL: [Format; 44] = [
+    pub const ALL: [Format; 64] = [
         Format::Png,
         Format::Jpeg,
         Format::Gif,
@@ -144,6 +164,26 @@ impl Format {
         Format::Otf,
         Format::Woff,
         Format::Woff2,
+        Format::Zip,
+        Format::Cbz,
+        Format::Tar,
+        Format::TarGz,
+        Format::Gz,
+        Format::SevenZ,
+        Format::Folder,
+        Format::Favicon,
+        Format::Md,
+        Format::Html,
+        Format::Pdf,
+        Format::Txt,
+        Format::Epub,
+        Format::Mobi,
+        Format::Raw,
+        Format::Stl,
+        Format::Obj,
+        Format::Ply,
+        Format::Gltf,
+        Format::Glb,
     ];
 
     pub fn kind(self) -> Kind {
@@ -157,6 +197,10 @@ impl Format {
             Json | Yaml | Toml | Xml | Csv => Kind::Data,
             Srt | Vtt | Ass => Kind::Subtitle,
             Ttf | Otf | Woff | Woff2 => Kind::Font,
+            Zip | Cbz | Tar | TarGz | Gz | SevenZ | Folder => Kind::Archive,
+            Favicon | Raw => Kind::Image,
+            Stl | Obj | Ply | Gltf | Glb => Kind::Model,
+            Md | Html | Pdf | Txt | Epub | Mobi => Kind::Document,
         }
     }
 
@@ -207,6 +251,26 @@ impl Format {
             Format::Otf => "otf",
             Format::Woff => "woff",
             Format::Woff2 => "woff2",
+            Format::Zip => "zip",
+            Format::Cbz => "cbz",
+            Format::Tar => "tar",
+            Format::TarGz => "tgz",
+            Format::Gz => "gz",
+            Format::SevenZ => "7z",
+            Format::Folder => "folder",
+            Format::Favicon => "favicon",
+            Format::Md => "md",
+            Format::Html => "html",
+            Format::Pdf => "pdf",
+            Format::Txt => "txt",
+            Format::Epub => "epub",
+            Format::Mobi => "mobi",
+            Format::Raw => "raw",
+            Format::Stl => "stl",
+            Format::Obj => "obj",
+            Format::Ply => "ply",
+            Format::Gltf => "gltf",
+            Format::Glb => "glb",
         }
     }
 
@@ -279,6 +343,18 @@ impl Format {
         )
     }
 
+    /// Results that aren't a file type of their own: "extract to a folder", "favicon pack".
+    /// They can be chosen as a target but never recognised in a file.
+    pub fn is_pseudo(self) -> bool {
+        matches!(self, Format::Folder | Format::Favicon)
+    }
+
+    /// Camera RAW file extensions (lower case). Most are TIFF underneath, so only the file
+    /// name tells them from a TIFF picture.
+    pub const RAW_EXTENSIONS: [&'static str; 24] = [
+        "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "orf", "rw2", "rwl", "raf", "pef", "srw", "3fr", "erf", "kdc", "mrw", "mef", "mos", "iiq", "dcr",
+    ];
+
     fn from_extension(ext: &str) -> Option<Format> {
         Some(match ext.to_ascii_lowercase().as_str() {
             "png" | "apng" => Format::Png,
@@ -325,6 +401,24 @@ impl Format {
             "otf" => Format::Otf,
             "woff" => Format::Woff,
             "woff2" => Format::Woff2,
+            "zip" => Format::Zip,
+            "cbz" => Format::Cbz,
+            "tar" => Format::Tar,
+            "tgz" => Format::TarGz,
+            "gz" => Format::Gz,
+            "7z" => Format::SevenZ,
+            "md" | "markdown" | "mdown" | "mkd" => Format::Md,
+            "html" | "htm" | "xhtml" => Format::Html,
+            "pdf" => Format::Pdf,
+            "txt" | "text" => Format::Txt,
+            "stl" => Format::Stl,
+            "obj" => Format::Obj,
+            "ply" => Format::Ply,
+            "gltf" => Format::Gltf,
+            "glb" => Format::Glb,
+            "epub" => Format::Epub,
+            "mobi" | "azw" | "azw3" | "prc" => Format::Mobi,
+            ext if Self::RAW_EXTENSIONS.contains(&ext) => Format::Raw,
             _ => return None,
         })
     }
@@ -334,6 +428,10 @@ impl Format {
         let starts = |p: &[u8]| head.starts_with(p);
         let at = |o: usize, p: &[u8]| head.get(o..o + p.len()) == Some(p);
         let text = String::from_utf8_lossy(head);
+        let is_html = {
+            let t = text.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+            t.starts_with("<!doctype html") || t.starts_with("<html")
+        };
         if starts(b"\x89PNG\r\n\x1a\n") {
             Some(Format::Png)
         } else if starts(&[0xFF, 0xD8, 0xFF]) {
@@ -342,6 +440,9 @@ impl Format {
             Some(Format::Gif)
         } else if starts(b"BM") {
             Some(Format::Bmp)
+        } else if (starts(b"II*\0") && at(8, b"CR")) || starts(b"FUJIFILMCCD-RAW") || starts(b"IIRS") || starts(b"IIRO") || starts(b"MMOR") || starts(b"IIU\0") || (at(4, b"ftyp") && at(8, b"crx ")) {
+            // Canon CR2 and CR3, Fujifilm RAF, Olympus ORF, Panasonic RW2.
+            Some(Format::Raw)
         } else if starts(b"II*\0") || starts(b"MM\0*") {
             Some(Format::Tiff)
         } else if starts(&[0, 0, 1, 0]) {
@@ -373,6 +474,8 @@ impl Format {
             Some(Format::Psd)
         } else if text.trim_start_matches('\u{feff}').trim_start().starts_with("<svg") {
             Some(Format::Svg)
+        } else if is_html {
+            Some(Format::Html)
         } else if starts(b"RIFF") && at(8, b"AVI ") {
             Some(Format::Avi)
         } else if starts(b"RIFF") && at(8, b"WAVE") {
@@ -384,6 +487,24 @@ impl Format {
         } else if starts(&[0x1A, 0x45, 0xDF, 0xA3]) {
             // Matroska or WebM, audio or video: `probe::refine` looks at the tracks.
             Some(Format::Mkv)
+        } else if starts(b"%PDF-") {
+            Some(Format::Pdf)
+        } else if starts(b"glTF") {
+            Some(Format::Glb)
+        } else if starts(b"ply\n") || starts(b"ply\r\n") {
+            Some(Format::Ply)
+        } else if starts(b"solid ") || starts(b"solid\n") || starts(b"solid\r") {
+            Some(Format::Stl)
+        } else if starts(b"PK\x03\x04") && at(30, b"mimetype") && at(38, b"application/epub+zip") {
+            Some(Format::Epub)
+        } else if at(60, b"BOOKMOBI") || at(60, b"TEXtREAd") {
+            Some(Format::Mobi)
+        } else if starts(b"PK\x03\x04") || starts(b"PK\x05\x06") {
+            Some(Format::Zip)
+        } else if starts(&[0x1F, 0x8B]) {
+            Some(Format::Gz)
+        } else if starts(b"7z\xBC\xAF\x27\x1C") {
+            Some(Format::SevenZ)
         } else if starts(b"wOFF") {
             Some(Format::Woff)
         } else if starts(b"wOF2") {
@@ -462,12 +583,35 @@ mod tests {
         assert_eq!(Format::sniff(b"OTTO\0\x0a"), Some(Format::Otf));
         assert_eq!(Format::sniff(b"\0\x01\0\0\0\x0a"), Some(Format::Ttf));
         assert_eq!(Format::sniff(b"\xef\xbb\xbfWEBVTT\n\n"), Some(Format::Vtt));
+        assert_eq!(Format::sniff(b"PK\x03\x04rest"), Some(Format::Zip));
+        assert_eq!(Format::sniff(&[0x1F, 0x8B, 8, 0]), Some(Format::Gz));
+        assert_eq!(Format::sniff(b"7z\xBC\xAF\x27\x1C\0"), Some(Format::SevenZ));
+        assert_eq!(Format::from_extension("folder"), None, "pseudo formats are never read from a name");
+        assert_eq!(Format::sniff(b"%PDF-1.7\n"), Some(Format::Pdf));
+        assert_eq!(Format::sniff(b"\xef\xbb\xbf  <!DOCTYPE HTML><html>"), Some(Format::Html));
+        assert_eq!(Format::sniff(b"<html lang=en>"), Some(Format::Html));
+        assert_eq!(Format::sniff(b"<svg xmlns="), Some(Format::Svg), "svg is not a web page");
+        let mut epub = b"PK\x03\x04\x14\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x08\0\0\0mimetypeapplication/epub+zip".to_vec();
+        epub.resize(64, 0);
+        assert_eq!(Format::sniff(&epub), Some(Format::Epub), "an EPUB is a zip, but not just a zip");
+        let mut mobi = vec![0u8; 60];
+        mobi.extend_from_slice(b"BOOKMOBI");
+        assert_eq!(Format::sniff(&mobi), Some(Format::Mobi));
+        assert_eq!(Format::sniff(b"II*\0\x10\0\0\0CR\x02\0"), Some(Format::Raw), "Canon CR2");
+        assert_eq!(Format::sniff(b"\0\0\0\x18ftypcrx \0\0\0\x01"), Some(Format::Raw), "Canon CR3, not an MP4");
+        assert_eq!(Format::sniff(b"FUJIFILMCCD-RAW 0201"), Some(Format::Raw));
+        assert_eq!(Format::sniff(b"IIRS\x08\0\0\0"), Some(Format::Raw));
+        assert_eq!(Format::sniff(b"II*\0\x08\0\0\0\x19\0"), Some(Format::Tiff), "Nikon, Sony and DNG look like TIFF until the name says otherwise");
+        assert_eq!(Format::from_extension("NEF"), Some(Format::Raw));
+        assert_eq!(Format::sniff(b"glTF\x02\0\0\0"), Some(Format::Glb));
+        assert_eq!(Format::sniff(b"ply\nformat ascii 1.0\n"), Some(Format::Ply));
+        assert_eq!(Format::sniff(b"solid cube\nfacet normal"), Some(Format::Stl));
         assert_eq!(Format::sniff(b"nope"), None);
     }
 
     #[test]
     fn every_format_round_trips_its_extension() {
-        for f in Format::ALL {
+        for f in Format::ALL.into_iter().filter(|f| !f.is_pseudo()) {
             assert_eq!(Format::from_extension(f.extension()), Some(f), "{f}");
         }
     }

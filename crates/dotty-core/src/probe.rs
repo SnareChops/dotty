@@ -45,8 +45,19 @@ pub fn refine(path: &Path, sniffed: Format) -> Format {
             Some((_, t)) if t.audio => Format::Mka,
             _ => sniffed,
         },
+        // Comic book archives are zips by another name; .tar.gz / .tgz are gzip around a tar.
+        Format::Zip if has_ext(path, "cbz") => Format::Cbz,
+        // Most camera RAW formats are TIFF files by another name.
+        Format::Tiff if Format::RAW_EXTENSIONS.iter().any(|e| has_ext(path, e)) => Format::Raw,
+        // Many EPUBs don't keep their `mimetype` entry first, which is how content sniffing knows them.
+        Format::Zip if has_ext(path, "epub") => Format::Epub,
+        Format::Gz if has_ext(path, "tgz") || path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.to_ascii_lowercase().ends_with(".tar")) => Format::TarGz,
         f => f,
     }
+}
+
+fn has_ext(path: &Path, ext: &str) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 fn open(path: &Path) -> Option<(BufReader<File>, u64)> {

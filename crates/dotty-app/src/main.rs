@@ -5,6 +5,7 @@ mod audio_editor;
 mod crop_box;
 mod editor;
 mod frame_picker;
+mod model_viewer;
 mod player;
 mod range_bar;
 mod video_editor;
@@ -13,6 +14,7 @@ mod video_worker;
 use audio_editor::AudioEditor;
 use editor::{Editor, Outcome};
 use frame_picker::FramePicker;
+use model_viewer::ModelViewer;
 use video_editor::VideoEditor;
 use eframe::egui;
 use std::path::PathBuf;
@@ -92,6 +94,7 @@ impl Entry {
             (Kind::Video, Kind::Image) => Some(Tool::Frames),
             (Kind::Video, Kind::Video) | (Kind::Image, Kind::Video) => Some(Tool::Video),
             (Kind::Image, _) => Some(Tool::Image),
+            (Kind::Model, _) => Some(Tool::Model),
             _ => None,
         }
     }
@@ -137,6 +140,8 @@ enum Tool {
     /// Picking a video's frame(s) for pictures.
     Frames,
     Video,
+    /// Looking at a 3D model (nothing to edit).
+    Model,
 }
 
 enum ActiveEditor {
@@ -148,6 +153,8 @@ enum ActiveEditor {
     Video(Box<VideoEditor>),
     /// Editing the frames picked from a video; the pick is saved with the picture edits.
     VideoPicture(Editor, dotty_core::FrameSelection),
+    /// The 3D model viewer.
+    Model(Box<ModelViewer>),
 }
 
 /// What an editor produced, plus the video edits already on the entry (a song's chosen
@@ -208,6 +215,9 @@ impl App {
         codecs_video::register(&mut registry);
         codecs_data::register(&mut registry);
         codecs_font::register(&mut registry);
+        codecs_archive::register(&mut registry);
+        codecs_doc::register(&mut registry);
+        codecs_model::register(&mut registry);
         let registry = Arc::new(registry);
 
         // Large files are memory-hungry (some encoders hold the whole stream), so don't
@@ -260,6 +270,21 @@ impl App {
             && let Some(t) = [Format::Webm, Format::Mp4, Format::Mkv].into_iter().find(|t| targets.contains(t))
         {
             return Some(t);
+        }
+        // 3D printing wants STL; everything else is happy with GLB.
+        if from.kind() == Kind::Model {
+            let pick = if from == Format::Stl { Format::Glb } else { Format::Stl };
+            if targets.contains(&pick) {
+                return Some(pick);
+            }
+        }
+        // A PDF is what people mostly want from a document source.
+        if from.kind() == Kind::Document && targets.contains(&Format::Pdf) {
+            return Some(Format::Pdf);
+        }
+        // Opening an archive is what people mostly want from one.
+        if from.kind() == Kind::Archive && targets.contains(&Format::Folder) {
+            return Some(Format::Folder);
         }
         targets.into_iter().next()
     }
@@ -343,6 +368,7 @@ impl App {
     fn open_editor(&mut self, ctx: &egui::Context, i: usize) {
         let e = &self.entries[i];
         self.editor = Some(match e.tool() {
+            Some(Tool::Model) => ActiveEditor::Model(Box::new(ModelViewer::open(ctx, e.path.clone(), e.from))),
             Some(Tool::Video) => ActiveEditor::Video(Box::new(VideoEditor::open(ctx, e.id, e.path.clone(), e.from, e.edits.clone()))),
             Some(Tool::Audio) => {
                 // Normalizing in the editor measures the layout the target will be written in.
@@ -439,6 +465,11 @@ impl App {
                     self.set_edits(ctx, id, edits, thumb);
                 }
             },
+            Some(ActiveEditor::Model(viewer)) => {
+                if matches!(viewer.show(ctx), model_viewer::Outcome::Closed) {
+                    self.editor = None;
+                }
+            }
             Some(ActiveEditor::Frames(picker)) => match picker.show(ctx) {
                 frame_picker::Outcome::Open => {}
                 frame_picker::Outcome::Cancelled => self.editor = None,
@@ -518,8 +549,9 @@ impl App {
         for f in Format::ALL {
             let targeting: Vec<&Entry> = self.entries.iter().filter(|e| e.to == Some(f)).collect();
             let multi = targeting.iter().any(|e| e.multi);
+            let sources: Vec<Format> = targeting.iter().map(|e| e.from).collect();
             let target: Vec<Choice> =
-                self.registry.choices(f).into_iter().filter(|c| !targeting.is_empty() && (multi || !c.multi_image_only)).collect();
+                self.registry.choices_from(f, &sources).into_iter().filter(|c| !targeting.is_empty() && (multi || !c.multi_image_only)).collect();
             if !target.is_empty() {
                 out.push((f, false, target));
             }
@@ -715,8 +747,11 @@ impl App {
                                 }
                             });
                         }
-                        let label = if e.edits.is_some() { "Edit •" } else { "Edit" };
-                        let help = if tool == Some(Tool::Video) {
+                        let model = tool == Some(Tool::Model);
+                        let label = if model { "Preview" } else if e.edits.is_some() { "Edit •" } else { "Edit" };
+                        let help = if model {
+                            "Look at the model: drag to turn it, scroll to zoom"
+                        } else if tool == Some(Tool::Video) {
                             "Trim, crop, rotate, change speed, fade, add text or change the sound before converting"
                         } else if video && !audio {
                             "Pick the frame (or the stretch for an animation), then edit the picture if you like"
@@ -1027,7 +1062,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("a.png");
         std::fs::write(&png, include_bytes!("../tests/tiny.png")).unwrap();
-        let junk = dir.join("notes.txt");
+        let junk = dir.join("notes.xyz");
         std::fs::write(&junk, "hello").unwrap();
 
         let mut app = app();
@@ -1367,6 +1402,158 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("d.yaml")).unwrap().contains("c: x"));
         assert!(std::fs::read_to_string(dir.join("s.vtt")).unwrap().starts_with("WEBVTT"));
         assert!(std::fs::read(dir.join("f.woff2")).unwrap().starts_with(b"wOF2"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archives_extract_by_default_and_a_picture_becomes_a_favicon_pack() {
+        let dir = std::env::temp_dir().join(format!("tf-app-archive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("bundle.zip");
+        {
+            use std::io::Write;
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+            w.start_file("inside/a.txt", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"hello").unwrap();
+            w.finish().unwrap();
+        }
+        let logo = dir.join("logo.png");
+        std::fs::write(&logo, include_bytes!("../tests/tiny.png")).unwrap();
+        let mut a = app();
+        a.add_files([zip, logo]);
+        assert_eq!(a.entries[0].to, Some(Format::Folder), "extract by default");
+        assert!(a.targets(&a.entries[0]).contains(&Format::SevenZ));
+        assert!(!a.entries[0].editable());
+        a.entries[1].to = Some(Format::Favicon);
+        a.options.bundle = Some(BundleMode::Folder);
+        a.convert_all();
+        wait_idle(&mut a);
+        assert!(std::fs::read_to_string(dir.join("bundle/inside/a.txt")).unwrap() == "hello");
+        assert!(dir.join("logo-favicons/favicon.ico").exists());
+        assert!(a.entries.iter().all(|e| matches!(e.status, Status::Done(..))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn markdown_defaults_to_pdf_and_pictures_can_become_pdfs() {
+        let dir = std::env::temp_dir().join(format!("tf-app-doc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("readme.md"), "# Title\n\nSome *text*.\n").unwrap();
+        std::fs::write(dir.join("scan.png"), include_bytes!("../tests/tiny.png")).unwrap();
+        let mut a = app();
+        a.add_files([dir.join("readme.md"), dir.join("scan.png")]);
+        assert_eq!((a.entries[0].from, a.entries[0].to), (Format::Md, Some(Format::Pdf)));
+        assert!(a.targets(&a.entries[0]).contains(&Format::Html));
+        assert!(a.targets(&a.entries[1]).contains(&Format::Pdf), "any picture can become a PDF");
+        assert_ne!(a.entries[1].to, Some(Format::Pdf), "but a picture's default stays a picture");
+        a.entries[1].to = Some(Format::Pdf);
+        a.convert_all();
+        wait_idle(&mut a);
+        assert!(a.entries.iter().all(|e| matches!(e.status, Status::Done(..))));
+        assert!(std::fs::read(dir.join("readme.pdf")).unwrap().starts_with(b"%PDF-"));
+        assert!(std::fs::read(dir.join("scan.pdf")).unwrap().starts_with(b"%PDF-"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pdf_offers_pictures_and_text_and_asks_before_making_a_page_each() {
+        let dir = std::env::temp_dir().join(format!("tf-app-pdf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let long: String = (0..6).map(|i| format!("# Part {i}\n\n{}\n\n", "Some words to fill a page with text. ".repeat(60))).collect();
+        std::fs::write(dir.join("book.md"), long).unwrap();
+        let mut a = app();
+        a.add_files([dir.join("book.md")]);
+        a.convert_all();
+        wait_idle(&mut a);
+        assert!(dir.join("book.pdf").exists());
+
+        let mut a = app();
+        a.add_files([dir.join("book.pdf")]);
+        assert_eq!(a.entries[0].from, Format::Pdf);
+        let targets = a.targets(&a.entries[0]);
+        assert!(targets.contains(&Format::Png) && targets.contains(&Format::Txt) && !targets.contains(&Format::Favicon));
+        assert_eq!(a.entries[0].to, Some(Format::Png), "pages as pictures by default");
+        a.convert_all();
+        assert!(a.ask_bundle.is_some() && !a.busy(), "several pages: folder or zip?");
+        let ids = a.ask_bundle.take().unwrap();
+        a.start_with(ids, Some(BundleMode::Folder));
+        wait_idle(&mut a);
+        assert!(matches!(a.entries[0].status, Status::Done(..)));
+        assert!(dir.join("book-pages/book-01.png").exists());
+
+        // The text of the same PDF.
+        a.entries[0].status = Status::Ready;
+        a.entries[0].to = Some(Format::Txt);
+        a.convert_all();
+        wait_idle(&mut a);
+        assert!(std::fs::read_to_string(dir.join("book.txt")).unwrap().contains("Part 3"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_raw_photo_can_be_edited_and_converted_like_any_picture() {
+        let dir = std::env::temp_dir().join(format!("tf-app-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A TIFF-style file with an 800×600 JPEG inside, named like a Nikon RAW.
+        let mut jpeg = Vec::new();
+        codecs_video::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80).encode_image(&codecs_video::image::RgbImage::from_pixel(800, 600, codecs_video::image::Rgb([200, 100, 50]))).unwrap();
+        let mut raw = vec![b'I', b'I', 42, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        raw.extend_from_slice(&jpeg);
+        std::fs::write(dir.join("DSC_0001.NEF"), raw).unwrap();
+        let mut a = app();
+        a.add_files([dir.join("DSC_0001.NEF")]);
+        assert_eq!(a.entries[0].from, Format::Raw);
+        assert!(a.entries[0].to.is_some_and(|t| t.kind() == Kind::Image), "a picture target by default");
+        assert!(a.entries[0].editable(), "the picture editor works on it");
+        let targets = a.targets(&a.entries[0]);
+        assert!(targets.contains(&Format::Jpeg) && targets.contains(&Format::Pdf) && targets.contains(&Format::Webp));
+        a.entries[0].to = Some(Format::Jpeg);
+        a.convert_all();
+        wait_idle(&mut a);
+        assert!(matches!(a.entries[0].status, Status::Done(..)));
+        assert_eq!(codecs_video::image::image_dimensions(dir.join("DSC_0001.jpg")).unwrap(), (800, 600));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_3d_model_converts_previews_and_can_become_a_picture() {
+        let dir = std::env::temp_dir().join(format!("tf-app-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 0 0 1\nv 1 0 1\nv 1 1 1\nv 0 1 1\nf 1 3 2\nf 1 4 3\nf 5 6 7\nf 5 7 8\nf 1 2 6\nf 1 6 5\nf 2 3 7\nf 2 7 6\nf 3 4 8\nf 3 8 7\nf 4 1 5\nf 4 5 8\n";
+        std::fs::write(dir.join("part.obj"), obj).unwrap();
+        let mut a = app();
+        a.add_files([dir.join("part.obj")]);
+        assert_eq!(a.entries[0].from, Format::Obj);
+        assert_eq!(a.entries[0].to, Some(Format::Stl), "3D printing is the likely goal");
+        assert_eq!(a.entries[0].tool(), Some(Tool::Model));
+        let targets = a.targets(&a.entries[0]);
+        assert!(targets.contains(&Format::Glb) && targets.contains(&Format::Ply) && targets.contains(&Format::Png), "other models and pictures");
+        assert!(!a.many_files_matter(), "one file out: no folder/zip question");
+
+        a.convert_all();
+        wait_idle(&mut a);
+        assert!(matches!(a.entries[0].status, Status::Done(..)));
+        let stl = std::fs::read(dir.join("part.stl")).unwrap();
+        assert_eq!(stl.len(), 84 + 12 * 50, "binary STL of 12 triangles");
+
+        // The STL goes on to GLB by default, then to a picture.
+        let mut a = app();
+        a.add_files([dir.join("part.stl")]);
+        assert_eq!(a.entries[0].to, Some(Format::Glb));
+        a.entries[0].to = Some(Format::Png);
+        let keys = |a: &App| a.relevant_choices().into_iter().filter(|(f, src, _)| *f == Format::Png && !src).flat_map(|(_, _, c)| c.into_iter().map(|c| c.key)).collect::<Vec<_>>();
+        assert!(keys(&a).contains(&"model_view") && keys(&a).contains(&"model_size"), "a model drawn as a picture offers view and size");
+        a.convert_all();
+        wait_idle(&mut a);
+        assert!(matches!(a.entries[0].status, Status::Done(..)));
+        assert_eq!(codecs_video::image::image_dimensions(dir.join("part.png")).unwrap(), (1024, 768));
+        // A photo going to PNG does not.
+        std::fs::write(dir.join("photo.bmp"), include_bytes!("../tests/tiny.png")).ok();
+        let mut b = app();
+        std::fs::write(dir.join("photo.png"), include_bytes!("../tests/tiny.png")).unwrap();
+        b.add_files([dir.join("photo.png")]);
+        b.entries[0].to = Some(Format::Png);
+        assert!(!keys(&b).iter().any(|k| k.starts_with("model_")), "no 3D settings for a photo: {:?}", keys(&b));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

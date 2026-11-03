@@ -678,3 +678,47 @@ fn animation_keeps_a_different_erase_per_frame() {
     assert_eq!((alpha(2, 1, 1), alpha(2, 6, 6)), (255, 0));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_favicon_pack_has_every_icon_in_a_folder_or_zip() {
+    let dir = tmp("favicon");
+    let src = dir.join("logo.png");
+    // A wide picture: it is centred on a square, not stretched.
+    image::RgbaImage::from_pixel(600, 300, image::Rgba([200, 30, 30, 255])).save(&src).unwrap();
+    let (cancel, progress) = (AtomicBool::new(false), |_: f32| {});
+    let conv = ImageConverter::default();
+    assert!(conv.routes().contains(&(Format::Png, Format::Favicon)) && conv.routes().contains(&(Format::Svg, Format::Favicon)));
+
+    let opts = Options::default();
+    assert!(conv.many_files(&src, Format::Png, Format::Favicon, &opts), "the app asks folder or zip");
+    let ctx = ConvertCtx::new(&opts, &cancel, &progress);
+    let dst = dir.join("logo.favicon");
+    conv.convert(&src, &dst, Format::Png, Format::Favicon, &ctx).unwrap();
+    let folder = dir.join("logo-favicons");
+    assert_eq!(ctx.take_output(), Some(folder.join("favicon.ico")));
+    for name in ["favicon.ico", "favicon-16x16.png", "favicon-32x32.png", "apple-touch-icon.png", "android-chrome-192x192.png", "android-chrome-512x512.png", "site.webmanifest", "favicon-snippet.html"] {
+        assert!(folder.join(name).exists(), "{name}");
+    }
+    let big = image::open(folder.join("android-chrome-512x512.png")).unwrap().to_rgba8();
+    assert_eq!(big.dimensions(), (512, 512));
+    assert_eq!(big.get_pixel(256, 256).0[3], 255, "the picture is in the middle");
+    assert_eq!(big.get_pixel(256, 10).0[3], 0, "and the padding above it is transparent");
+    let icons = decode_ico_sizes(&folder.join("favicon.ico"));
+    assert_eq!(icons, vec![48, 32, 16]);
+    assert!(ctx.take_notes().iter().any(|n| n.contains("favicon pack of 8 files")));
+
+    // As a zip.
+    let zip_opts = Options { bundle: Some(dotty_core::BundleMode::Zip), ..Default::default() };
+    let ctx = ConvertCtx::new(&zip_opts, &cancel, &progress);
+    conv.convert(&src, &dir.join("logo.favicon"), Format::Png, Format::Favicon, &ctx).unwrap();
+    assert_eq!(ctx.take_output(), Some(dir.join("logo-favicons.zip")));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn decode_ico_sizes(path: &Path) -> Vec<u32> {
+    let bytes = std::fs::read(path).unwrap();
+    let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+    let mut sizes: Vec<u32> = (0..count).map(|i| bytes[6 + i * 16] as u32).collect();
+    sizes.sort_by(|a, b| b.cmp(a));
+    sizes
+}

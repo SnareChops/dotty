@@ -126,6 +126,23 @@ impl Registry {
         out
     }
 
+    /// Settings offered for writing `to` when the files being converted are in the formats
+    /// `sources`: only converters that handle one of those routes (so 3D picture settings
+    /// don't show for a photo going to PNG).
+    pub fn choices_from(&self, to: Format, sources: &[Format]) -> Vec<Choice> {
+        let mut out: Vec<Choice> = Vec::new();
+        for (c, routes) in &self.converters {
+            if routes.iter().any(|r| r.1 == to && sources.contains(&r.0)) {
+                for choice in c.choices(to) {
+                    if !out.iter().any(|o| o.key == choice.key) {
+                        out.push(choice);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Whether the file holds several images (animation frames, pages, icon sizes).
     pub fn multi_image(&self, path: &Path, from: Format) -> bool {
         from.multi_image_input() && self.reading(from).is_some_and(|c| c.multi_image(path, from))

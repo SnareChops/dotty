@@ -16,3 +16,4 @@ zune-core = "0.5.3"
 zune-jpegxl = "0.5.2"
 tola-webp = "0.8.1"
 dotty-core = { version = "0.1.0", path = "../dotty-core" }
+rawkit = "0.1.0"

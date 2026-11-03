@@ -1,0 +1,21 @@
+[package]
+name = "codecs-doc"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dotty-core = { version = "0.1.0", path = "../dotty-core" }
+codecs-image = { version = "0.1.0", path = "../codecs-image" }
+krilla = "0.8.2"
+pulldown-cmark = "0.13.6"
+rustybuzz = "0.20.1"
+html5ever = "0.39"
+markup5ever_rcdom = "0.39.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+hayro = "0.8.0"
+mobi = "0.8.0"
+zip = { version = "9.2.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+lopdf = "0.46.0"

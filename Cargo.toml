@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/codecs-image", "crates/codecs-audio", "crates/codecs-video", "crates/codecs-data", "crates/codecs-font", "crates/dotty-core", "crates/dotty-app"]
+members = ["crates/codecs-image", "crates/codecs-audio", "crates/codecs-video", "crates/codecs-data", "crates/codecs-font", "crates/codecs-archive", "crates/codecs-doc", "crates/codecs-model", "crates/dotty-core", "crates/dotty-app"]
 
 [workspace.package]
 version = "0.1.0"

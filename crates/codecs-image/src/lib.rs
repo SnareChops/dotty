@@ -16,7 +16,9 @@ mod decode_extra;
 pub mod edit;
 mod encode;
 mod encode_multi;
+pub mod favicon;
 mod psd;
+pub mod raw;
 mod webp_meta;
 
 pub use decode::ImageCrateDecoder;
@@ -154,6 +156,7 @@ impl Default for ImageConverter {
         c.add_decoder(JxlDecoder);
         c.add_decoder(SvgDecoder);
         c.add_decoder(PsdDecoder);
+        c.add_decoder(raw::RawDecoder);
 
         c.add_encoder(PngEncoder);
         c.add_encoder(JpegEncoder);
@@ -207,7 +210,7 @@ impl Converter for ImageConverter {
     fn routes(&self) -> Vec<(Format, Format)> {
         self.decoders
             .iter()
-            .flat_map(|d| self.encoders.iter().map(move |e| (d.format(), e.format())))
+            .flat_map(|d| self.encoders.iter().map(move |e| (d.format(), e.format())).chain(std::iter::once((d.format(), Format::Favicon))))
             .collect()
     }
 
@@ -221,7 +224,7 @@ impl Converter for ImageConverter {
     }
 
     fn many_files(&self, src: &Path, from: Format, to: Format, options: &Options) -> bool {
-        options.split_frames && !Format::keeps_all_images(from, to) && self.multi_image(src, from)
+        to == Format::Favicon || (options.split_frames && !Format::keeps_all_images(from, to) && self.multi_image(src, from))
     }
 
     fn source_choices(&self, from: Format) -> Vec<Choice> {
@@ -230,6 +233,11 @@ impl Converter for ImageConverter {
 
     fn convert(&self, src: &Path, dst: &Path, from: Format, to: Format, ctx: &ConvertCtx) -> Result<()> {
         let decoder = self.decoders.iter().find(|d| d.format() == from).ok_or(Error::NoRoute { from, to })?;
+        if to == Format::Favicon {
+            (ctx.progress)(0.0);
+            let img = decoder.decode(src, 1, ctx)?;
+            return self.write(img, from, to, dst, ctx);
+        }
         let encoder = self.encoder(to).ok_or(Error::NoRoute { from, to })?;
         (ctx.progress)(0.0);
 
@@ -259,6 +267,20 @@ impl ImageConverter {
         decoder.decode(path, max_frames, ctx)
     }
 
+    /// Formats this converter writes (not counting the favicon pack).
+    pub fn writable(&self) -> Vec<Format> {
+        self.encoders.iter().map(|e| e.format()).collect()
+    }
+
+    /// One picture as a complete file of format `to`, in memory (a page of a PDF, say).
+    pub fn encode_to_vec(&self, img: ImageData, from: Format, to: Format, ctx: &ConvertCtx) -> Result<Vec<u8>> {
+        let encoder = self.encoder(to).ok_or(Error::NoRoute { from, to })?;
+        let img = color::for_encoder(img, encoder.float(), from, ctx.options);
+        let mut out = std::io::Cursor::new(Vec::new());
+        encoder.encode(&img, ctx, &mut out)?;
+        Ok(out.into_inner())
+    }
+
     /// Formats this converter reads.
     pub fn readable(&self) -> Vec<Format> {
         self.decoders.iter().map(|d| d.format()).collect()
@@ -267,6 +289,9 @@ impl ImageConverter {
     /// Everything after decoding: metadata, editor edits, keeping or splitting several
     /// frames as `to` allows, colour handling, encoding. Videos hand their frames in here.
     pub fn write(&self, mut img: ImageData, from: Format, to: Format, dst: &Path, ctx: &ConvertCtx) -> Result<()> {
+        if to == Format::Favicon {
+            return favicon::write(img, dst, ctx);
+        }
         let encoder = self.encoder(to).ok_or(Error::NoRoute { from, to })?;
         let keep_wanted = multi_choice(encoder).is_some_and(|c| ctx.options.choice(to, &c) == "all");
         if ctx.options.strip_metadata {

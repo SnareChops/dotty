@@ -210,7 +210,7 @@ fn edited_sound(src: &Path, from: Format, ve: &VideoEdits, result_secs: Option<f
         return Ok(None);
     }
     if let Some(file) = &ve.audio_file {
-        let Some(format) = Format::detect(file).filter(|f| f.kind() != dotty_core::Kind::Image) else {
+        let Some(format) = Format::detect(file).filter(|f| matches!(f.kind(), dotty_core::Kind::Audio | dotty_core::Kind::Video)) else {
             return Err(Error::Codec(format!("{} isn't a sound or video file Dotty can read", file.display())));
         };
         // A replacement soundtrack starts with the video: the part picked (from `audio_start`),

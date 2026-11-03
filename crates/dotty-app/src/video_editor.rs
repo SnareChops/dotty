@@ -367,7 +367,7 @@ impl VideoEditor {
         }
         let (path, from) = match &key.file {
             Some(f) => match Format::detect(f) {
-                Some(fmt) if fmt.kind() != dotty_core::Kind::Image => (f.clone(), fmt),
+                Some(fmt) if matches!(fmt.kind(), dotty_core::Kind::Audio | dotty_core::Kind::Video) => (f.clone(), fmt),
                 _ => {
                     self.notice = Some("That isn't a sound or video file Dotty can read".into());
                     self.sound = Sound::Failed(key);

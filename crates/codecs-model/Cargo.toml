@@ -1,0 +1,12 @@
+[package]
+name = "codecs-model"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dotty-core = { version = "0.1.0", path = "../dotty-core" }
+codecs-image = { version = "0.1.0", path = "../codecs-image" }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }

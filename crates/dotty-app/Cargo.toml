@@ -9,10 +9,13 @@ name = "dotty"
 path = "src/main.rs"
 
 [dependencies]
+codecs-archive = { version = "0.1.0", path = "../codecs-archive" }
 codecs-audio = { version = "0.1.0", path = "../codecs-audio" }
 codecs-data = { version = "0.1.0", path = "../codecs-data" }
+codecs-doc = { version = "0.1.0", path = "../codecs-doc" }
 codecs-font = { version = "0.1.0", path = "../codecs-font" }
 codecs-image = { version = "0.1.0", path = "../codecs-image" }
+codecs-model = { version = "0.1.0", path = "../codecs-model" }
 codecs-video = { version = "0.1.0", path = "../codecs-video" }
 eframe = { version = "0.37.0", features = ["persistence"] }
 rfd = "0.17.2"
@@ -20,3 +23,6 @@ dotty-core = { version = "0.1.0", path = "../dotty-core" }
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 cpal = "0.18.2"
 rtrb = "0.4.1"
+
+[dev-dependencies]
+zip = { version = "9.2.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }

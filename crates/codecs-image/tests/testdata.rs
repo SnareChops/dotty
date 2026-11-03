@@ -62,7 +62,7 @@ fn converts_samples(fast: bool) {
                     eprintln!("slow: {} → {to} ({preset:?}) took {:.1?}", src.file_name().unwrap().to_string_lossy(), t.elapsed());
                 }
                 match result {
-                    Ok(()) if Format::detect(&dst) == Some(to) => {}
+                    Ok(()) if to.is_pseudo() || Format::detect(&dst) == Some(to) => {}
                     Ok(()) => failures.push(format!("{} → {to}: output not recognised", src.display())),
                     Err(e) => failures.push(format!("{} → {to}: {e}", src.display())),
                 }
@@ -72,4 +72,54 @@ fn converts_samples(fast: bool) {
     std::fs::remove_dir_all(&out).ok();
     eprintln!("{count} conversions");
     assert!(failures.is_empty(), "{} of {count} failed:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// Every camera RAW sample in `testdata/raw` becomes a JPEG: the camera's own picture, or (Sony
+/// A6000-series) a full-resolution development. Two samples have no full-size picture inside
+/// and say so.
+#[test]
+fn raw_samples_become_pictures() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/raw");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        eprintln!("testdata/raw missing; run scripts/fetch-testdata.sh");
+        return;
+    };
+    let out = std::env::temp_dir().join(format!("tf-raw-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    let converter = ImageConverter::default();
+    let (cancel, progress) = (AtomicBool::new(false), |_: f32| {});
+    let (mut done, mut failures) = (0, Vec::new());
+    // (file, expected size when known)
+    let known = [("pentax-k5ii.PEF", (4928, 3264)), ("nikon-1j2.NEF", (3872, 2592)), ("canon-r6m3.CR3", (4320, 2880)), ("sony-a6400.ARW", (6048, 4024)), ("sony-rx0.ARW", (1616, 1080))];
+    for entry in entries.flatten() {
+        let src = entry.path();
+        let name = src.file_name().unwrap().to_string_lossy().into_owned();
+        let from = Format::detect(&src).unwrap_or_else(|| panic!("{name}: format not detected"));
+        if from != Format::Raw {
+            failures.push(format!("{name}: detected as {from}, not RAW"));
+            continue;
+        }
+        let options = Options::default();
+        let ctx = ConvertCtx::new(&options, &cancel, &progress);
+        let dst = out.join(format!("{name}.jpg"));
+        match converter.convert(&src, &dst, from, Format::Jpeg, &ctx) {
+            Ok(()) => {
+                done += 1;
+                let size = image::image_dimensions(&dst).unwrap();
+                if let Some((_, want)) = known.iter().find(|(n, _)| *n == name)
+                    && size != *want
+                {
+                    failures.push(format!("{name}: {size:?}, expected {want:?}"));
+                }
+                if size.0.max(size.1) < 400 {
+                    failures.push(format!("{name}: only {size:?}"));
+                }
+            }
+            Err(e) if (name.contains("a410") || name.contains("c5050z")) && e.to_string().contains("no full-size picture") => {}
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+    }
+    std::fs::remove_dir_all(&out).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(done >= 9, "only {done} RAW files converted");
 }
